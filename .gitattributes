@@ -1,0 +1,9 @@
+# 统一用 LF 入库，检出时也保持 LF：
+# stream.ps1 内嵌 C# 源码，换行被改成 CRLF 会导致编译失败。
+* text=auto eol=lf
+*.ps1 text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.gguf binary
+*.wav binary
+*.onnx binary

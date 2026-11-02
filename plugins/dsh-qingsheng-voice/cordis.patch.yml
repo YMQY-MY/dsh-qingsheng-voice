@@ -1,0 +1,5 @@
+- insert:
+    - id: qingsheng-voice
+      name: dsh-qingsheng-voice
+      config:
+        studioUrl: "http://127.0.0.1:3210"

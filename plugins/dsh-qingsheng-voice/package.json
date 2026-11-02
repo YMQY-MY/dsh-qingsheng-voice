@@ -1,0 +1,22 @@
+{
+  "name": "dsh-qingsheng-voice",
+  "version": "0.4.0",
+  "description": "清声 · 大肥鱼语音：自动表达引擎、会话历史朗读、分支上下文、PCM 播放与音色工作室",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "engines": { "node": ">=22", "dsh": ">=0.2.1-rc.5 <0.3.0-0" },
+  "files": ["src", "lib", "client", "cordis.patch.yml", "README.md"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-connection", "@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

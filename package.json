@@ -1,0 +1,12 @@
+{
+  "name": "dsh-qingsheng-voice-source",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/dsh-plugin.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
