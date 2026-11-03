@@ -51,7 +51,46 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\install-dsh-plugin
 | `voxcpm2-q8_0.gguf` | 2.8 GB | 备用 TTS 引擎 |
 | `sensevoice-small-q8-audiocpp-v1.gguf` | 242 MB | 中文语音识别 |
 
+### 从 HuggingFace 下载
+
+模型托管在 [YMQY-MY/dsh-qingsheng-voice-models](https://huggingface.co/YMQY-MY/dsh-qingsheng-voice-models)。
+
+**方式一：逐一下载**
+
+```bash
+BASE=https://huggingface.co/YMQY-MY/dsh-qingsheng-voice-models/resolve/main
+mkdir -p engine/models && cd engine/models
+curl -L -O $BASE/breeze-tts-2-q4_k.gguf
+curl -L -O $BASE/voxcpm2-q8_0.gguf
+curl -L -O $BASE/sensevoice-small-q8-audiocpp-v1.gguf
+```
+
+**方式二：用 huggingface-cli（支持断点续传，推荐大文件）**
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download YMQY-MY/dsh-qingsheng-voice-models \
+  --local-dir engine/models --local-dir-use-symlinks False
+```
+
+> 只想要 TTS、不需要语音识别的话，`sensevoice-small` 可以不下载，插件会禁用语音输入功能。
+
+### 目录结构
+
+下载完成后工作区应是这样：
+
+```
+<工作区根目录>/
+├── data/                     # 数据、音色库、会话（运行时生成）
+└── engine/
+    └── models/
+        ├── breeze-tts-2-q4_k.gguf
+        ├── voxcpm2-q8_0.gguf
+        └── sensevoice-small-q8-audiocpp-v1.gguf
+```
+
 > 本仓库不托管模型权重：GitHub 单文件上限 100 MB，且模型体积远超仓库建议大小。
+> 模型权重来自各自上游项目，本仓库仅作镜像分发，不主张所有权，详见 [NOTICE.md](./NOTICE.md)。
 
 ## 架构
 
