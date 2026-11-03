@@ -1,9 +1,31 @@
 {
   "name": "dsh-qingsheng-voice",
   "version": "0.4.0",
-  "description": "清声 · 大肥鱼语音：自动表达引擎、会话历史朗读、分支上下文、PCM 播放与音色工作室",
+  "description": "清声 · 大肥鱼语音：为 DeepSeek-Harness 提供本地 TTS 朗读、语音输入与音色工作室，全部在本机运行",
   "type": "module",
   "main": "./src/index.mjs",
+  "author": "YMQY-MY",
+  "license": "MIT",
+  "homepage": "https://github.com/YMQY-MY/dsh-qingsheng-voice",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YMQY-MY/dsh-qingsheng-voice.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YMQY-MY/dsh-qingsheng-voice/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "tts",
+    "voice",
+    "speech",
+    "asr",
+    "voice-clone",
+    "local-ai",
+    "breeze-tts"
+  ],
   "exports": {
     ".": "./src/index.mjs",
     "./client": "./lib/client.js",
@@ -11,7 +33,9 @@
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "engines": { "node": ">=22", "dsh": ">=0.2.1-rc.5 <0.3.0-0" },
-  "files": ["src", "lib", "client", "cordis.patch.yml", "README.md"],
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["src", "lib", "client", "cordis.patch.yml", "README.md", "NOTICE.md"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

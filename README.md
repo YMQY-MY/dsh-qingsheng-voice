@@ -77,6 +77,32 @@ DSH ──RPC──> 插件后台 (src/index.mjs)
 - `stream.ps1` 必须存为 **UTF-8 with BOM**。Windows PowerShell 5.x 在无 BOM 时按 ANSI 解码，中文注释会吞掉换行、破坏内嵌 C# 的编译。
 - 单次合成受引擎上下文限制，超长文本会自动分段。
 
+## 作者
+
+**YMQY-MY**
+
+- GitHub：[@YMQY-MY](https://github.com/YMQY-MY)
+- 问题反馈：[Issues](https://github.com/YMQY-MY/dsh-qingsheng-voice/issues)
+
+## 致谢
+
+本插件建立在以下项目之上，它们是各自作者的作品：
+
+- **Breeze TTS 2** — 本地 TTS 主引擎
+- **VoxCPM2** — 备选 TTS 引擎
+- **SenseVoice Small** — 中文语音识别
+- **清声工作台** — 本地语音服务与音色管理界面
+- **DeepSeek-Harness (DSH)** — 插件宿主
+
+这些组件的模型权重与二进制**均不随本仓库分发**，各有独立许可，详见 [NOTICE.md](./NOTICE.md)。
+
+## 贡献
+
+欢迎提交 Issue 与 Pull Request，请先阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
 ## 许可
 
-MIT，见 [LICENSE](./LICENSE)。
+[MIT License](./LICENSE) © 2026 YMQY-MY
+
+你可以自由使用、修改、分发，包括商业用途，只需保留版权声明。
+第三方组件的许可见 [NOTICE.md](./NOTICE.md)。
