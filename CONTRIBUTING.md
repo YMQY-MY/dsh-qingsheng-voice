@@ -27,8 +27,16 @@
 
 - 仅支持 Windows x64，Node.js ≥ 22。
 - 所有 `.mjs` 使用 ESM，不引入新的运行时依赖除非必要。
-- **`stream.ps1` 必须保存为 UTF-8 with BOM**，且仓库通过 `.gitattributes` 锁定 LF 换行。
-  该文件内嵌 C# 源码，编码或换行变化会导致编译失败、播放器无法启动。
+- **`stream.ps1` 必须保存为无 BOM + LF**。该文件由 `powershell.exe -File` 直接执行，
+  Windows PowerShell 会按本地代码页读取无 BOM 文件；文件内容全是 ASCII，无 BOM 反而在任何
+  代码页下都能正确解析。带上 BOM 反而会在部分宿主环境里表现为整篇解析失败
+  （典型症状：`Unexpected token '}'`）。仓库通过 `.gitattributes` 锁定 LF。
+- 用脚本改这个文件时，落盘方式必须是
+  `[IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding($false)))`。
+- 改完必须用 **Windows PowerShell 5.1** 解析一遍再交付，PowerShell 7 的解析器更宽松，验不出问题：
+  ```powershell
+  powershell.exe -NoProfile -Command "[void][System.Management.Automation.Language.Parser]::ParseFile('src/stream.ps1',[ref]`$null,[ref]`$e); `$e"
+  ```
 - 修改内嵌 C# 的 PowerShell 脚本后，请用与生产一致的 `powershell.exe -File` 方式实际运行验证，
   不要只用 `Get-Content` 读取后 `Add-Type` 编译（两种解码路径不同）。
 

@@ -1,8 +1,7 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $config = [Console]::In.ReadLine() | ConvertFrom-Json
-$assembly = Join-Path ([string]$config.cacheRoot) 'waveout-v1.dll'
 $source = @'
 using System;
 using System.Collections.Generic;
@@ -39,43 +38,57 @@ public sealed class QingShengWave : IDisposable {
   public int Collect() { for(int i=buffers.Count-1;i>=0;i--){var h=(Header)Marshal.PtrToStructure(buffers[i],typeof(Header));if((h.flags&1)!=0){Free(buffers[i]);buffers.RemoveAt(i);}}return buffers.Count; }
   public uint BytesPlayed { get { var p=new Position{type=4};Check(waveOutGetPosition(handle,ref p,12));if(p.type!=4)throw new InvalidOperationException("Unsupported audio clock");return p.value; } }
   public void Pause(){Check(waveOutPause(handle));} public void Resume(){Check(waveOutRestart(handle));}
+  public void Cut(){Check(waveOutReset(handle));for(int i=buffers.Count-1;i>=0;i--){Free(buffers[i]);buffers.RemoveAt(i);}Check(waveOutRestart(handle));}
   public void Dispose(){if(handle==IntPtr.Zero)return;waveOutReset(handle);foreach(var h in buffers)Free(h);buffers.Clear();waveOutClose(handle);handle=IntPtr.Zero;}
 }
 '@
-if(!(Test-Path -LiteralPath $assembly)) {
+$bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($source)
+$digest = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+$stamp = [BitConverter]::ToString($digest).Replace('-', '').ToLower().Substring(0, 12)
+$assembly = Join-Path ([string]$config.cacheRoot) ('waveout-' + $stamp + '.dll')
+if (-not (Test-Path -LiteralPath $assembly)) {
   try { Add-Type -TypeDefinition $source -OutputAssembly $assembly -ErrorAction Stop }
-  catch { if(!(Test-Path -LiteralPath $assembly)) { throw } }
+  catch { if (-not (Test-Path -LiteralPath $assembly)) { throw } }
 }
 Add-Type -Path $assembly
 $player = New-Object QingShengWave ([int]$config.sampleRate)
 [QingShengWave]::StartInput()
-$finishing=$false
-$paused=$false
-$clock=[Diagnostics.Stopwatch]::StartNew()
-$last=0L
+$paused = $false
+$cursor = 0L
+$last = -1000
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$running = $true
 try {
   [Console]::Out.WriteLine('{"type":"ready"}')
-  while($true) {
-    $line=[QingShengWave]::ReadCommand(10)
-    if($null -ne $line) {
-      $command=$line | ConvertFrom-Json
-      switch([string]$command.action) {
+  while ($running) {
+    $line = [QingShengWave]::ReadCommand(10)
+    if ($null -ne $line) {
+      $command = $line | ConvertFrom-Json
+      $action = [string]$command.action
+      switch ($action) {
         'audio' { $player.Add([Convert]::FromBase64String([string]$command.data)) }
-        'pause' { $player.Pause();$paused=$true }
-        'resume' { $player.Resume();$paused=$false }
-        'finish' { $finishing=$true }
-        'stop' { break }
-        default { throw 'Unknown audio command' }
+        'pause' { $player.Pause(); $paused = $true }
+        'resume' { $player.Resume(); $paused = $false }
+        'cut' { $player.Cut(); $paused = $false }
+        'finish' { }
+        'stop' { $running = $false }
+        default { throw ('Unknown audio command: ' + $action) }
       }
-      if($command.action -eq 'stop'){break}
     }
-    $queued=$player.Collect()
-    if($clock.ElapsedMilliseconds-$last -ge 100) {
-      $last=$clock.ElapsedMilliseconds
-      [Console]::Out.WriteLine((@{type='position';bytes=[long]$player.BytesPlayed;paused=$paused} | ConvertTo-Json -Compress))
+    $queued = $player.Collect()
+    $played = [long]$player.BytesPlayed
+    $due = (($clock.ElapsedMilliseconds - $last) -ge 100)
+    if ($due -and ($played -ne $cursor)) {
+      $last = $clock.ElapsedMilliseconds
+      $cursor = $played
+      [Console]::Out.WriteLine((@{type='position';bytes=$played;paused=$paused} | ConvertTo-Json -Compress))
     }
-    if($finishing -and $queued -eq 0 -and !$paused){break}
-    if([QingShengWave]::InputClosed -and !$finishing){break}
+    if (($queued -eq 0) -and (-not $paused) -and ($played -gt 0)) {
+      [Console]::Out.WriteLine((@{type='done';bytes=$played} | ConvertTo-Json -Compress))
+      $cursor = 0
+    }
+    if ([QingShengWave]::InputClosed) { $running = $false }
   }
-  [Console]::Out.WriteLine((@{type='done';bytes=[long]$player.BytesPlayed} | ConvertTo-Json -Compress))
-} finally { $player.Dispose() }
+} finally {
+  $player.Dispose()
+}

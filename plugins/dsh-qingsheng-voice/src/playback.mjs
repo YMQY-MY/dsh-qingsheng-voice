@@ -67,6 +67,17 @@ export class ConversationPlayback {
     this.generation++;this.controller?.abort(Error('声音已停止。'));this.controller=null;this.output=null;this.paused=false;this.phase='idle';
     if(this.preview?.status==='generating')this.preview.status='cancelled';
   }
+  // 立即打断当前朗读，但不停止这一轮对话、也不销毁播放进程。
+  // 通话插件听出用户开口时调它，让清声「听见就住口」；返回是否真的打断了在播的声音。
+  interrupt(reason){
+    const had=!!this.controller;
+    this.generation++;this.controller?.abort(reason?Error(reason):Error('声音被打断。'));this.controller=null;
+    try{this.player?.interrupt?.(Error(reason||'声音被打断。'));}catch{}
+    this.output=null;this.paused=false;
+    if(this.preview?.status==='generating')this.preview.status='cancelled';
+    if(!this.phase||this.phase!=='error')this.phase='idle';
+    return {interrupted:had,speaking:!!this.player?.speaking};
+  }
   pause(){if(!this.controller)return{paused:false};this.paused=true;this.output?.pause();this.phase='paused';return{paused:true};}
   resume(){if(!this.controller||!this.paused)return{resumed:false};this.paused=false;this.output?.resume();this.phase=this.output?'playing':'generating';return{resumed:true};}
   async replay(replyId){

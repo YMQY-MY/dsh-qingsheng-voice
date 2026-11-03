@@ -56,6 +56,13 @@ export class VoiceBridge extends ConversationPlayback {
   stop() {
     return this.stopPlayback();
   }
+  interrupt(reason) {
+    return this.interruptPlayback(reason);
+  }
+  // 通话插件用的「谁在说话」快照：它在不在出声、卡在哪一相位。
+  get speechState() {
+    return {speaking:!!this.player?.speaking,phase:this.phase,paused:this.paused,firstAudioMs:this.firstAudioMs};
+  }
   speak(text,options={}) {
     return this.startPlayback(text,options);
   }
@@ -65,5 +72,5 @@ export class VoiceBridge extends ConversationPlayback {
     const selected=state?.voices.find(v=>v.id===this.preferences.voiceId);
     return {connected:!!state,capabilities:state?.capabilities||{},emotion:{available:true,config:{...this.emotion.config},lastPlan:this.emotion.lastPlan,warning:this.emotion.warning||''},engine:state?.engine,recognition:state?.recognition,voices:state?.voices || [],preferences:{...this.preferences},phase:this.phase,error:this.error || connectionError || '',warning:this.warning||'',preview:this.preview||null,playback:{paused:this.paused,positionSeconds:this.positionSeconds,totalSeconds:this.totalSeconds,firstAudioMs:this.firstAudioMs,cached:!!this.replayedFromCache,canReplay:!!this.lastAnswers.get(this.focus)||!!this.readLatest,voiceLocked:selected?.kind==='reference'||!!(selected&&this.voiceLocks[this.voiceKey(selected)])},sessionId:this.focus};
   }
-  async dispose() { this.closed = true; this.stop(); this.pending.clear(); await Promise.allSettled([...this.active,this.saves,this.lockSaves,this.emotion.saves]); }
+  async dispose() { this.closed = true; this.stop(); try{await this.player?.dispose?.();}catch{} this.pending.clear(); await Promise.allSettled([...this.active,this.saves,this.lockSaves,this.emotion.saves]); }
 }

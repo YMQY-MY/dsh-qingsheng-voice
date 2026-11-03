@@ -1,4 +1,4 @@
-import path from 'node:path';
+﻿import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { VoiceBridge } from './bridge.mjs';
@@ -35,11 +35,14 @@ export async function apply(ctx, options = {}) {
         const input = message.payload; if(!input || typeof input !== 'object')throw Error('缺少操作。');
         let value;
         switch(input.action) {
-          case 'status': value = {...await bridge.status(request.signal),pluginVersion:'0.4.0',protocolVersion:4,studio:{url:config.studioUrl,ready:await launcher.healthy()}}; break;
+          case 'status': value = {...await bridge.status(request.signal),pluginVersion:'0.5.0',protocolVersion:5,studio:{url:config.studioUrl,ready:await launcher.healthy()}}; break;
           case 'studio.ensure': value = {url:config.studioUrl, ...await launcher.ensure()}; break;
           case 'focus': bridge.select(input.sessionId); value = {selected:true}; break;
           case 'configure': value = await bridge.configure(input.preferences || {}); break;
           case 'stop': bridge.stop(); value = {stopped:true}; break;
+          // 通话插件用：只打断正在播的这一句，不结束这一轮对话，也不销毁常驻播放进程。
+          case 'interrupt': value=bridge.interrupt(input.reason); break;
+          case 'speech.state': value={...bridge.speechState,pluginVersion:'0.5.0'}; break;
           case 'pause': value=bridge.pause();break;
           case 'resume': value=bridge.resume();break;
           case 'replay': if(input.sessionId)bridge.select(input.sessionId);value=await bridge.replay(input.replyId);break;
