@@ -43,7 +43,9 @@ export class StudioClient extends VoiceLibrary {
     const useRef=strategy==='clone'&&hasReference;
     // 已确认 Breeze 在 clone 模式下也接受 instruction：走 clone 既锁住参考声纹又能带情绪，
     // 不要再为了表达而切到 direction——那会把声纹重新造一遍。
-    const job = await this.request('/api/jobs', {text, voiceId:voice.id, seed:voice.seed??42, mode:useRef?'clone':'design',...(steady?{cfg:state.engine.kind==='breeze'?1:3,direction:options.direction||deliveryInstruction}:{}),...((useRef&&reference)?{reference:reference.reference,transcript:reference.transcript}:{})});
+    // 2026-11-04 实测：同一参考音频下无指令 2.96s / 情绪指令 3.52s，音高方差与过零率同步分开，
+    // 且同组两次逐位一致。因此只要有 direction 就发出去，不再限制在 steady 档；steady 档额外把 cfg 调到 1。
+    const job = await this.request('/api/jobs', {text, voiceId:voice.id, seed:voice.seed??42, mode:useRef?'clone':'design',...((options.direction||steady)?{cfg:state.engine.kind==='breeze'?1:3,direction:options.direction||deliveryInstruction}:{}),...((useRef&&reference)?{reference:reference.reference,transcript:reference.transcript}:{})});
     onJob(job.id);
     try {
       signal.throwIfAborted();

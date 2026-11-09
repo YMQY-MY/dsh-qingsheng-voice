@@ -1,14 +1,24 @@
-﻿import path from 'node:path';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { VoiceBridge } from './bridge.mjs';
 import { StudioLauncher } from './launcher.mjs';
+import { Autostart } from './autostart.mjs';
 import {latestReplyText,assistantHistory,historyReply} from './text.mjs';
 export const name = 'qingsheng-voice';
 export const inject = ['sessions','connection'];
 export async function apply(ctx, options = {}) {
   const config = {studioUrl:options.studioUrl || 'http://127.0.0.1:3210',dataRoot:path.resolve(options.dataRoot || process.env.QINGSHENG_PLUGIN_DATA || path.join(import.meta.dirname,'../../../data/dsh-plugin')),studioExe:options.studioExe};
   const launcher = new StudioLauncher({base:config.studioUrl, workspace:options.workspace || process.env.QINGSHENG_WORKSPACE, logger:ctx.logger});
+  // 开机自启：装一次，以后开机服务自己起来，不用用户记着开工作台。
+  // 用户可用 QINGSHENG_AUTOSTART=0 关闭。
+  const autostart = new Autostart({appDir:options.appDir || 'G:\\ai\\应用\\清声工作台', workspaceRoot:options.workspace || process.env.QINGSHENG_WORKSPACE || 'G:\\ai\\AI组件\\声音', logger:ctx.logger});
+  if(process.env.QINGSHENG_AUTOSTART !== '0'){
+    autostart.ensure().then(r => {
+      if(r.registered) ctx.logger?.info?.('清声开机自启已就绪。');
+      else if(!r.ok) ctx.logger?.warn?.('清声自启注册跳过：' + (r.reason || r.error || '未知'));
+    }).catch(() => {});
+  }
   // 不阻塞插件加载：工作台启动要十几秒，先把 bridge 建好，后台再去确认/拉起。
   launcher.ensure().then(r => {
     if(r.ready) ctx.logger?.info?.(r.launched ? '清声工作台已自动就绪。' : '清声工作台已在运行。');
@@ -37,6 +47,8 @@ export async function apply(ctx, options = {}) {
         switch(input.action) {
           case 'status': value = {...await bridge.status(request.signal),pluginVersion:'0.5.0',protocolVersion:5,studio:{url:config.studioUrl,ready:await launcher.healthy()}}; break;
           case 'studio.ensure': value = {url:config.studioUrl, ...await launcher.ensure()}; break;
+      case 'autostart.status': value = await autostart.status(); break;
+      case 'autostart.install': value = await autostart.ensure(); break;
           case 'focus': bridge.select(input.sessionId); value = {selected:true}; break;
           case 'configure': value = await bridge.configure(input.preferences || {}); break;
           case 'stop': bridge.stop(); value = {stopped:true}; break;
@@ -92,6 +104,14 @@ export async function apply(ctx, options = {}) {
             try{value=await bridge.studio.promoteVoice(preview.jobId,input.name,request.signal);preview.savedVoiceId=value.id;await bridge.configure({voiceId:value.id});}finally{bridge.promoting=false;}break;
           }
           case 'speak': if(typeof input.text !== 'string' || input.text.length>6000)throw Error('试听文字无效。'); bridge.speak(input.text); value = {started:true}; break;
+          // 通话插件要的是「念完再回来」：这里等这一段真正播完才回包，它拿到回包才回去继续听。
+          case 'speak.await': {
+            if(typeof input.text !== 'string' || !input.text.trim() || input.text.length>6000)throw Error('朗读文字无效。');
+            if(input.sessionId)bridge.select(input.sessionId);
+            await bridge.speak(input.text);
+            value={spoken:true,speaking:bridge.speechState.speaking};
+            break;
+          }
           case 'transcribe': {
             bridge.stop(); const controller = new AbortController(); transcriptions.add(controller);
             try { value = await bridge.studio.transcribe(input.base64,AbortSignal.any([controller.signal,request.signal])); }

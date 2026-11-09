@@ -17,6 +17,9 @@ references/
 *.onnx
 *.safetensors
 
+# 工作台运行时（二进制引擎约 349MB，随 npm 包/Release 分发，不进 git）
+plugins/dsh-qingsheng-voice/studio/
+
 # 凭据与本地配置
 .env
 .env.*

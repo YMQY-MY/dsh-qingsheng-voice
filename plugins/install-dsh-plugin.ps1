@@ -1,78 +1,93 @@
-param([string]$DshDirectory = '', [string]$StudioRoot = '')
+﻿param([string]$DshDirectory = '', [string]$Profile = 'desktop')
+# 清声语音插件安装器。
+# 工作台和推理引擎都在插件包内（studio/），所以这个脚本只做一件事：
+# 把插件装进 DSH 的 profile 并启用。不需要问工作区、不需要问工作台在哪、不需要先装任何东西。
 $ErrorActionPreference = 'Stop'
 $packageDir = Join-Path $PSScriptRoot 'dsh-qingsheng-voice'
-if(!$DshDirectory) { $DshDirectory = Read-Host 'DSH installation directory' }
-if(!$StudioRoot) { $StudioRoot = Read-Host 'QingSheng workspace directory' }
-if(!$DshDirectory -or !$StudioRoot) { throw 'Both DSH and QingSheng directories are required.' }
-$launcher = Join-Path $DshDirectory 'resources/runtime/cli/bin/dsh.cmd'
-if(!(Test-Path -LiteralPath $launcher)) { throw 'DSH launcher not found. Select the installed DSH directory.' }
-if(!(Test-Path -LiteralPath $StudioRoot -PathType Container)) { throw 'QingSheng workspace directory not found.' }
 if(!(Test-Path -LiteralPath (Join-Path $packageDir 'package.json'))) { throw 'Plugin package not found next to this installer.' }
-$StudioRoot = [IO.Path]::GetFullPath($StudioRoot)
-$cache = Join-Path $StudioRoot 'artifacts/dsh-plugin-install'
+
+# 没给 DSH 目录就自己找：常见安装位置 + 当前 .dsh 根。
+if(!$DshDirectory) {
+  $candidates = @()
+  if($env:DSH_HOME) { $candidates += $env:DSH_HOME }
+  $candidates += (Join-Path $env:USERPROFILE '.dsh')
+  $candidates += @('C:\dsh-data','D:\dsh-data','E:\dsh-data')
+  foreach($c in $candidates) {
+    if($c -and (Test-Path -LiteralPath (Join-Path $c 'profiles'))) { $DshDirectory = $c; break }
+  }
+}
+if(!$DshDirectory) { $DshDirectory = Read-Host 'DSH data directory (the one containing profiles\)' }
+
+$dshHome = [IO.Path]::GetFullPath($DshDirectory)
+$profileDir = Join-Path $dshHome ('profiles/' + $Profile)
+if (!(Test-Path -LiteralPath (Join-Path $profileDir 'package.json'))) { throw ('Not a DSH profile: ' + $profileDir + ' — open DSH Desktop once first.') }
+
+# 宿主真正加载的是 profile 的 node_modules；这里直接放装，不依赖 npm/pnpm 网络。
+$installedDir = Join-Path $profileDir 'node_modules/dsh-qingsheng-voice'
+
+$cache = Join-Path (Join-Path (Join-Path $env:USERPROFILE '.dsh') 'artifacts') 'qingsheng-install'
 New-Item -ItemType Directory -Force -Path $cache | Out-Null
-$profile = Join-Path $(if($env:DSH_HOME){$env:DSH_HOME}else{Join-Path $env:USERPROFILE '.dsh'}) 'profiles/desktop'
-if (!(Test-Path -LiteralPath (Join-Path $profile 'package.json'))) { throw 'Open DSH Desktop once before installing this plugin.' }
 $backup = Join-Path $cache ('backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force -Path $backup | Out-Null
-foreach($name in @('package.json','pnpm-lock.yaml','cordis.patch.yml')) {
-  $source = Join-Path $profile $name
-  if(Test-Path -LiteralPath $source){Copy-Item -LiteralPath $source -Destination (Join-Path $backup $name)}
+foreach($name in @('package.json','cordis.patch.yml')) {
+  $source = Join-Path $profileDir $name
+  if(Test-Path -LiteralPath $source){ Copy-Item -LiteralPath $source -Destination (Join-Path $backup $name) }
 }
-$url = 'http://127.0.0.1:3210'
-$exeName = (-join ([char[]]@(0x6e05,0x58f0,0x5de5,0x4f5c,0x53f0))) + '.exe'
-$exePath = Join-Path (Join-Path $StudioRoot 'dist/Qingsheng') $exeName
-$patch = @('- insert:', '    - id: qingsheng-voice', '      name: dsh-qingsheng-voice', '      config:', ('        studioUrl: '+($url | ConvertTo-Json -Compress)), ('        dataRoot: '+((Join-Path $StudioRoot 'data/dsh-plugin') | ConvertTo-Json -Compress)), ('        studioExe: '+($exePath | ConvertTo-Json -Compress)))
-[IO.File]::WriteAllLines((Join-Path $packageDir 'cordis.patch.yml'),$patch,(New-Object Text.UTF8Encoding($false)))
-$env:TEMP = $cache
-$env:TMP = $cache
-$env:npm_config_cache = Join-Path $cache 'npm-cache'
-$env:npm_config_store_dir = Join-Path $cache 'pnpm-store'
-$env:COREPACK_HOME = Join-Path $cache 'corepack'
-$log = Join-Path $cache ('install-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
-Write-Host 'Installing QingSheng voice through the official DSH plugin manager...'
-$existingManifest = Get-Content -LiteralPath (Join-Path $profile 'package.json') -Raw | ConvertFrom-Json
-$installedDir = Join-Path $profile 'node_modules/dsh-qingsheng-voice'
-$alreadyCurrent = ($existingManifest.dsh.profile.bundles -contains 'dsh-qingsheng-voice')
+
+Write-Host ('Installing QingSheng voice into ' + $profileDir + ' ...')
+New-Item -ItemType Directory -Force -Path $installedDir | Out-Null
+$copied = 0
 foreach($sourceFile in @(Get-ChildItem -LiteralPath $packageDir -Recurse -File)) {
   $relative = $sourceFile.FullName.Substring($packageDir.Length).TrimStart([char]92,[char]47)
+  # 不覆盖用户已有的数据目录与已下载模型
+  if($relative -like 'studio\data\*' -or $relative -like 'studio/engine/models/*') { continue }
   $installedFile = Join-Path $installedDir $relative
-  if(!(Test-Path -LiteralPath $installedFile)){ $alreadyCurrent = $false; break }
-  if((Get-FileHash -LiteralPath $sourceFile.FullName).Hash -ne (Get-FileHash -LiteralPath $installedFile).Hash){ $alreadyCurrent = $false; break }
-}
-if($alreadyCurrent) {
-  Write-Host 'The installed plugin matches this package; no package changes are needed.'
-  $installExitCode = 0
-} else {
-$ErrorActionPreference = 'Continue'
-& $launcher plugin --profile desktop add ('file:'+$packageDir) --ignore-scripts --offline 2>&1 | Tee-Object -FilePath $log
-$installExitCode = $LASTEXITCODE
-$ErrorActionPreference = 'Stop'
-}
-if ($installExitCode -ne 0) { throw ('DSH plugin installation failed. Log: '+$log) }
-$manifest = Get-Content -LiteralPath (Join-Path $profile 'package.json') -Raw | ConvertFrom-Json
-if (!($manifest.dsh.profile.bundles -contains 'dsh-qingsheng-voice')) { throw 'DSH did not enable the voice bundle. Check the plugin page before retrying.' }
-# pnpm can reuse a file dependency snapshot when its version is unchanged.
-# Replace only this plugin's files, breaking store hardlinks before writing.
-if(!(Test-Path -LiteralPath (Join-Path $installedDir 'package.json'))) { throw 'DSH did not create the plugin installation directory.' }
-$refreshed = 0
-foreach($sourceFile in @(Get-ChildItem -LiteralPath $packageDir -Recurse -File)) {
-  $relative = $sourceFile.FullName.Substring($packageDir.Length).TrimStart([char]92,[char]47)
-  $installedFile = Join-Path $installedDir $relative
-  $same = (Test-Path -LiteralPath $installedFile) -and ((Get-FileHash -LiteralPath $sourceFile.FullName).Hash -eq (Get-FileHash -LiteralPath $installedFile).Hash)
-  if(!$same) {
-    New-Item -ItemType Directory -Force -Path (Split-Path $installedFile -Parent) | Out-Null
-    $stagedFile = $installedFile + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
-    try {
-      Copy-Item -LiteralPath $sourceFile.FullName -Destination $stagedFile
-      Move-Item -LiteralPath $stagedFile -Destination $installedFile -Force
-    } finally {
-      if(Test-Path -LiteralPath $stagedFile) { Remove-Item -LiteralPath $stagedFile -Force }
-    }
-    $refreshed++
+  New-Item -ItemType Directory -Force -Path (Split-Path $installedFile -Parent) | Out-Null
+  $stagedFile = $installedFile + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+  try {
+    Copy-Item -LiteralPath $sourceFile.FullName -Destination $stagedFile
+    Move-Item -LiteralPath $stagedFile -Destination $installedFile -Force
+  } finally {
+    if(Test-Path -LiteralPath $stagedFile) { Remove-Item -LiteralPath $stagedFile -Force }
   }
-  if((Get-FileHash -LiteralPath $sourceFile.FullName).Hash -ne (Get-FileHash -LiteralPath $installedFile).Hash) { throw ('Installed file verification failed: ' + $relative) }
+  $copied++
 }
-Write-Host ('Verified plugin files. Refreshed: ' + $refreshed)
-[pscustomobject]@{plugin='dsh-qingsheng-voice';version='0.1.0';profile=$profile;backup=$backup;log=$log;installedAt=(Get-Date -Format o)} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $cache 'receipt.json') -Encoding UTF8
-Write-Host 'Installed. If the voice controls do not appear yet, restart DSH after the current task finishes.'
+Write-Host ('Copied ' + $copied + ' files.')
+
+# 启用 bundle：写 profiles 的 package.json 依赖 + dsh.profile.bundles
+$manifestPath = Join-Path $profileDir 'package.json'
+$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+if(!$manifest.dependencies) { $manifest | Add-Member -NotePropertyName dependencies -NotePropertyValue ([pscustomobject]@{}) -Force }
+$deps = @{}
+foreach($p in $manifest.dependencies.PSObject.Properties) { $deps[$p.Name] = $p.Value }
+$deps['dsh-qingsheng-voice'] = 'file:' + ($packageDir -replace '\\','/')
+$manifest.dependencies = [pscustomobject]$deps
+$bundles = @()
+if($manifest.dsh -and $manifest.dsh.profile -and $manifest.dsh.profile.bundles) { $bundles = @($manifest.dsh.profile.bundles) }
+if($bundles -notcontains 'dsh-qingsheng-voice') { $bundles += 'dsh-qingsheng-voice' }
+if(!$manifest.dsh) { $manifest | Add-Member -NotePropertyName dsh -NotePropertyValue ([pscustomobject]@{}) -Force }
+if(!$manifest.dsh.profile) { $manifest.dsh | Add-Member -NotePropertyName profile -NotePropertyValue ([pscustomobject]@{}) -Force }
+$manifest.dsh.profile.bundles = $bundles
+$json = $manifest | ConvertTo-Json -Depth 20
+[IO.File]::WriteAllText($manifestPath, $json, (New-Object Text.UTF8Encoding($false)))
+Write-Host 'Enabled the voice bundle.'
+
+# 挂载配置：studioUrl 与数据目录都指向包内的 studio/
+$dataRoot = Join-Path $installedDir 'studio/data/dsh-plugin'
+$patchPath = Join-Path $installedDir 'cordis.patch.yml'
+$patch = @(
+  '- insert:',
+  '    - id: qingsheng-voice',
+  '      name: dsh-qingsheng-voice',
+  '      config:',
+  '        studioUrl: "http://127.0.0.1:3210"',
+  ('        dataRoot: ' + ($dataRoot | ConvertTo-Json -Compress))
+)
+[IO.File]::WriteAllLines($patchPath, $patch, (New-Object Text.UTF8Encoding($false)))
+Write-Host 'Wrote mount config.'
+
+$version = (Get-Content -LiteralPath (Join-Path $packageDir 'package.json') -Raw | ConvertFrom-Json).version
+[pscustomobject]@{plugin='dsh-qingsheng-voice';version=$version;profile=$profileDir;backup=$backup;installedAt=(Get-Date -Format o)} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $cache 'receipt.json') -Encoding UTF8
+Write-Host ''
+Write-Host 'Installed. 下次启动 DSH 时插件会自动拉起包内的工作台与引擎；'
+Write-Host '首次运行需要下载声音模型（约 2.7 GB），放在 studio/engine/models/。'

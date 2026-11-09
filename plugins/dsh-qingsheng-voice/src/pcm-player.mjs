@@ -4,149 +4,160 @@ import {setTimeout as delay} from 'node:timers/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {parseWave} from './voices.mjs';
-const newline=String.fromCharCode(10);
-// 一条音频流：常驻播放子进程里的一次「朗读会话」。
-// 以前每次 speak 都 spawn 一个新进程（PowerShell 启动 + Add-Type 编译就是几百毫秒），
-// 通话场景一句接一句时延迟和资源都受不了。现在进程由 NativePlayer 持有并复用，
-// 打断只发 cut 把队列清空，进程继续待命等下一句。
+const rates = new Set([16000,22050,24000,44100,48000]);
+
+// One logical PCM stream on a reusable helper process. Every command and event
+// carries its stream identity, so an old position/done cannot settle a new one.
 class PlaybackStream {
-  constructor(player,sampleRate,signal,onProgress){
-    this.player=player;this.sampleRate=sampleRate;this.signal=signal;this.onProgress=onProgress;
-    this.bytes=0;this.position=0;this.paused=false;this.done=false;this.finishing=false;this.failure=null;
-    this.onFinish=null;this.finished=new Promise(resolve=>{this.onFinish=resolve;});
-    this.ready=Promise.resolve();
+  constructor(player,id,sampleRate,signal,onProgress){
+    this.player=player;this.id=id;this.sampleRate=sampleRate;this.signal=signal;this.onProgress=onProgress;
+    this.bytes=0;this.position=0;this.paused=false;this.done=false;this.finishing=false;this.failure=null;this.begun=false;
+    this.finished=new Promise(resolve=>{this.onFinish=resolve;});
   }
+  _check(){this.signal.throwIfAborted();if(this.done)throw this.failure||Error('这段声音已结束。');}
   async writePCM(bytes){
-    this.signal.throwIfAborted();
-    if(this.done)throw this.failure||Error('这段声音已结束。');
-    await this.ready;
-    // 背压：落后太多就不再往里塞，避免整段音频堆在进程内存里（打断时也就更干脆）。
-    while(!this.done&&(this.bytes-this.position)/(this.sampleRate*2)>6){await delay(40,undefined,{signal:this.signal});}
-    this.signal.throwIfAborted();
-    if(this.done)throw this.failure||Error('这段声音已结束。');
-    this.bytes+=bytes.length;
-    // 子进程用 Console.ReadLine() 逐行读命令，单行过长（base64 膨胀 4/3）会让整条命令解析失败、
-    // 这块音频被静默丢掉。按 8KB 原始字节切开发送，保证每行远低于行长度上限。
-    const slice=8192;
-    for(let off=0;off<bytes.length;off+=slice){
-      if(this.done)throw this.failure||Error('这段声音已结束。');
-      await this.player.send({action:'audio',data:bytes.subarray(off,off+slice).toString('base64')});
+    this._check();await this.ready;this._check();
+    // 前瞻缓冲从 6 秒收到 2.5 秒：6 秒意味着整段回复可以提前塞进声卡队列，
+    // 合成只要比播放快就一路压进来，段间那点换气缝被彻底吃掉，
+    // 听感变成「上一句还没说完下一句就响」。2.5 秒够抗抖动，又留得住段间间隙。
+    while(!this.done&&(this.bytes-this.position)/(this.sampleRate*2)>2.5)await delay(40,undefined,{signal:this.signal});
+    this._check();
+    if(!Buffer.isBuffer(bytes)||!bytes.length||bytes.length%2)throw Error('PCM 数据无效。');
+    // Keep Console.ReadLine JSON commands below its practical line limit.
+    for(let off=0;off<bytes.length;off+=8192){
+      this._check();const chunk=bytes.subarray(off,off+8192);
+      await this.player._sendTo(this.process,{action:'audio',streamId:this.id,data:chunk.toString('base64')});
+      this.bytes+=chunk.length;
     }
   }
-  pause(){if(this.done)return;this.paused=true;this.player.send({action:'pause'}).catch(()=>{});}
-  resume(){if(this.done)return;this.paused=false;this.player.send({action:'resume'}).catch(()=>{});}
-  async finish(){if(this.done)return;this.finishing=true;await this.player.send({action:'finish'});return this.finished;}
-  // 被打断：让子进程把还没播的缓冲全部丢掉，然后继续待命。不销毁进程。
+  pause(){if(this.done)return;this.paused=true;this._command('pause');}
+  resume(){if(this.done)return;this.paused=false;this._command('resume');}
+  _command(action){this.ready.then(()=>{if(!this.done)return this.player._sendTo(this.process,{action,streamId:this.id});}).catch(()=>{});}
+  async finish(){
+    await this.ready;
+    if(!this.done&&!this.finishing){this.finishing=true;await this.player._sendTo(this.process,{action:'finish',streamId:this.id});}
+    if(!this.done)await this.finished;
+    if(this.failure)throw this.failure;
+  }
   interrupt(reason=Error('声音被打断。')){
     if(this.done)return;
     this.done=true;this.failure=reason;this.finishing=false;
-    try{this.player.send({action:'cut'}).catch(()=>{});}catch{}
-    this.onFinish();
-    this._detach();
+    if(this.begun)this.player._sendTo(this.process,{action:'cut',streamId:this.id}).catch(()=>{});
+    this._detach();this.onFinish();
   }
-  // 播放器进程退出：把这一段标为失败，避免调用方永远等下去。
-  _aborted(error){
-    if(this.done)return;
-    this.done=true;this.failure=error||Error('声音播放器已退出。');this.onFinish();this._detach();
-  }
-  _detach(){try{this.signal.removeEventListener('abort',this._onAbort);}catch{}}
-  _start(signal){this._onAbort=()=>this.interrupt(signal.reason||Error('声音已停止。'));signal.addEventListener('abort',this._onAbort,{once:true});if(signal.aborted)this._onAbort();}
+  _aborted(error){if(this.done)return;this.done=true;this.failure=error||Error('声音播放器已退出。');this._detach();this.onFinish();}
+  _complete(bytes){if(this.done)return;this.position=bytes;this.done=true;this._detach();this.onFinish();}
+  _detach(){this.signal.removeEventListener('abort',this._onAbort);}
+  _start(){this._onAbort=()=>this.interrupt(this.signal.reason||Error('声音已停止。'));this.signal.addEventListener('abort',this._onAbort,{once:true});if(this.signal.aborted)this._onAbort();}
 }
+
 export class NativePlayer {
   constructor(root,{idleMs=120000}={}){
-    this.root=path.resolve(root,'playback');
-    this.idleMs=idleMs;this.child=null;this.ready=null;this.readiness=null;this.current=null;this.failure=null;this.idleTimer=null;this.closed=false;this.recycling=false;
+    this.root=path.resolve(root,'playback');this.idleMs=idleMs;
+    this.process=null;this.child=null;this.ready=null;this.current=null;this.failure=null;this.idleTimer=null;this.closed=false;this.sequence=0;
   }
-  _fail(error){
-    const reject=this.readiness;this.readiness=null;this.ready=null;
-    try{reject?.(error);}catch{}
+  // Starts only the audio helper/device, without opening a logical utterance or
+  // sending PCM. Call when a voice call starts, overlapping model/ASR latency.
+  async warm(sampleRate=24000,signal){
+    signal?.throwIfAborted();
+    if(this.current&&!this.current.done&&this.current.sampleRate!==sampleRate)return{ready:false,reason:'busy-sample-rate'};
+    const pending=this._ensure(sampleRate);const state=this.process;await pending;signal?.throwIfAborted();this._touch();
+    return{ready:true,pid:state.child.pid,sampleRate:state.sampleRate};
   }
-  // 懒启动：第一次真正要出声时才起进程，之后一直复用，直到空闲超时或插件卸载。
-  createStream(sampleRate,signal,onProgress=()=>{}){
+  createStream(sampleRate,signal=new AbortController().signal,onProgress=()=>{}){
     signal.throwIfAborted();
-    const stream=new PlaybackStream(this,sampleRate,signal,onProgress);
-    stream._start(signal);
-    // 同一时刻只有一段在播：上一段还没结束就打断它，避免两路音频叠在一起。
+    if(!rates.has(sampleRate))throw Error('不支持的音频采样率。');
+    if(this.closed)throw Error('声音播放器已关闭。');
     if(this.current&&!this.current.done)this.current.interrupt(Error('被新的朗读替换。'));
-    this.current=stream;
-    stream.ready=this._ensure(sampleRate).catch(error=>{stream._aborted(error);throw error;});
-    stream.ready.catch(()=>{});
-    this._touch();
-    return stream;
+    const stream=new PlaybackStream(this,String(++this.sequence),sampleRate,signal,onProgress);
+    this.current=stream;stream._start();
+    const pending=this._ensure(sampleRate);stream.process=this.process;
+    stream.ready=pending.then(async()=>{
+      stream._check();
+      if(stream.process!==this.process)throw Error('声音播放器已更换。');
+      // Mark first: an abort while the write callback is pending must queue cut
+      // after begin, rather than leave an unowned logical stream in the helper.
+      stream.begun=true;
+      await this._sendTo(stream.process,{action:'begin',streamId:stream.id});
+      stream._check();
+    }).catch(error=>{stream._aborted(error);throw error;});
+    stream.ready.catch(()=>{});this._touch();return stream;
   }
   _ensure(sampleRate){
-    if(this.child)return Promise.resolve();
-    if(this.readiness)return this.readiness;
-    const started=new Promise((resolve,reject)=>{
-      this.readiness=reject;
-      (async()=>{
-        await mkdir(this.root,{recursive:true});
-        if(this.closed)throw Error('声音播放器已关闭。');
-        const child=spawn('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',fileURLToPath(new URL('./stream.ps1',import.meta.url))],{windowsHide:true,env:{...process.env,TEMP:this.root,TMP:this.root},stdio:['pipe','pipe','pipe']});
-        this.child=child;this.failure=null;
-        let pending='',error='',everReady=false;
-        const timer=setTimeout(()=>this._fail(Error('声音播放器启动超时。')),20000);
-        child.stderr.on('data',b=>{error=(error+b.toString()).slice(-2000);});
-        child.stdout.on('data',b=>{
-          pending+=b.toString();let i;
-          while((i=pending.indexOf(newline))>=0){
-            const line=pending.slice(0,i).trim();pending=pending.slice(i+1);if(!line)continue;
-            let event;try{event=JSON.parse(line);}catch{continue;}
-            if(event.type==='ready'){if(everReady)continue;everReady=true;clearTimeout(timer);this.readiness=null;resolve();continue;}
-            if(event.type==='done'){
-              const stream=this.current;
-              if(stream&&!stream.done&&stream.finishing){stream.done=true;stream.onFinish();}
-              continue;
-            }
-            if(event.type==='position'){
-              const stream=this.current;if(!stream||stream.done)continue;
-              stream.position=event.bytes;
-              try{stream.onProgress(stream.position/(stream.sampleRate*2));}catch{}
-            }
-          }
-        });
-        child.stdin.on('error',()=>{});
-        child.on('error',e=>{clearTimeout(timer);this._fail(Error(e.message));this._died(Error(e.message));});
-        child.on('close',code=>{clearTimeout(timer);this._fail(Error(error||'声音播放器提前退出。'));this._died(Error(error||('声音播放器退出（'+code+'）。')));});
-        await this.send({sampleRate,cacheRoot:this.root});
-      })().catch(error=>this._fail(error));
-    });
-    this.ready=started;
-    started.catch(()=>{this.ready=null;});
-    return started;
+    if(this.closed)return Promise.reject(Error('声音播放器已关闭。'));
+    if(!rates.has(sampleRate))return Promise.reject(Error('不支持的音频采样率。'));
+    // A spawned child is not yet a ready child. Share this exact Promise through
+    // mkdir, PowerShell initialization, Add-Type and the first ready handshake.
+    if(this.process?.sampleRate===sampleRate)return this.process.ready;
+    if(this.process)this._retire(this.process,Error('音频采样率改变。'));
+    const state={sampleRate,child:null,pending:'',stderr:'',settled:false,retired:false};
+    state.ready=new Promise((resolve,reject)=>{state.resolve=resolve;state.reject=reject;});
+    state.ready.catch(()=>{});this.process=state;this.ready=state.ready;this.failure=null;
+    void this._launch(state);return state.ready;
   }
-  _died(error){
-    this.child=null;this.ready=null;
-    clearTimeout(this.idleTimer);this.idleTimer=null;
-    // 空闲回收是我们自己主动结束的，不算故障，下次按需重启即可。
-    if(this.recycling){this.recycling=false;this.failure=null;return;}
-    this.failure=error;
-    const stream=this.current;this.current=null;
-    if(stream&&!stream.done)stream._aborted(error);
+  async _launch(state){
+    try{
+      await mkdir(this.root,{recursive:true});
+      if(state!==this.process||state.retired||this.closed)throw Error('声音播放器启动已取消。');
+      const child=spawn('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',fileURLToPath(new URL('./stream.ps1',import.meta.url))],{windowsHide:true,env:{...process.env,TEMP:this.root,TMP:this.root},stdio:['pipe','pipe','pipe']});
+      state.child=child;this.child=child;
+      state.timer=setTimeout(()=>this._died(state,Error('声音播放器启动超时。')),20000);state.timer.unref?.();
+      child.stderr.on('data',b=>{state.stderr=(state.stderr+b.toString()).slice(-2000);});
+      child.stdout.on('data',b=>{
+        if(state!==this.process||state.retired)return;
+        state.pending+=b.toString();let index;
+        while((index=state.pending.indexOf('\n'))>=0){
+          const line=state.pending.slice(0,index).trim();state.pending=state.pending.slice(index+1);if(!line)continue;
+          try{this._event(state,JSON.parse(line));}catch{}
+        }
+      });
+      child.stdin.on('error',()=>{});
+      child.on('error',error=>this._died(state,error));
+      child.on('close',code=>this._died(state,Error(state.stderr||'声音播放器退出（'+code+'）。')));
+      // The first line is the process configuration, not an utterance command.
+      await this._sendTo(state,{sampleRate:state.sampleRate,cacheRoot:this.root});
+    }catch(error){this._died(state,error);}
   }
-  send(value){
+  _event(state,event){
+    if(state!==this.process||state.retired)return;
+    if(event.type==='ready'){
+      if(!state.settled){state.settled=true;clearTimeout(state.timer);state.resolve();}return;
+    }
+    const stream=this.current;
+    if(!stream||stream.done||stream.process!==state||String(event.streamId)!==stream.id)return;
+    if(event.type==='position'){
+      const bytes=Number(event.bytes);if(!Number.isSafeInteger(bytes)||bytes<0)return;
+      stream.position=Math.min(bytes,stream.bytes);try{stream.onProgress(stream.position/(stream.sampleRate*2));}catch{}
+    }else if(event.type==='done'&&stream.finishing){stream._complete(stream.bytes);}
+    else if(event.type==='error'){stream._aborted(Error(event.message||'声音播放失败。'));}
+  }
+  _died(state,error){
+    // Retiring process A must never clear or reject the readiness/current stream
+    // of process B, even when A's close callback runs after B is already ready.
+    if(state!==this.process||state.retired)return;
+    this.failure=error;const stream=this.current;
+    this._retire(state,error);
+    if(stream?.process===state&&!stream.done)stream._aborted(error);
+  }
+  _retire(state,error){
+    if(state.retired)return;state.retired=true;clearTimeout(state.timer);
+    if(!state.settled){state.settled=true;state.reject(error||Error('声音播放器已结束。'));}
+    if(state===this.process){this.process=null;this.child=null;this.ready=null;clearTimeout(this.idleTimer);this.idleTimer=null;}
+    try{state.child?.stdin.end();}catch{}try{state.child?.kill();}catch{}
+  }
+  _sendTo(state,value){
     return new Promise((resolve,reject)=>{
-      const child=this.child;
-      if(!child||!child.stdin.writable)return reject(Error('声音播放器未就绪。'));
-      this._touch();
-      child.stdin.write(JSON.stringify(value)+newline,e=>e?reject(e):resolve());
+      const child=state?.child;
+      if(!state||state!==this.process||state.retired||!child?.stdin.writable)return reject(Error('声音播放器未就绪。'));
+      this._touch();child.stdin.write(JSON.stringify(value)+'\n',error=>error?reject(error):resolve());
     });
   }
-  _touch(){
-    clearTimeout(this.idleTimer);this.idleTimer=null;
-    if(this.idleMs>0){this.idleTimer=setTimeout(()=>this._recycle(),this.idleMs);this.idleTimer.unref?.();}
-  }
-  _recycle(){
-    if(this.closed||!this.child)return;
-    if(this.current&&!this.current.done)return this._touch();
-    this.recycling=true;this._kill();
-  }
-  _kill(){const child=this.child;this.child=null;this.ready=null;this.readiness=null;try{child?.stdin.end();}catch{}try{child?.kill();}catch{}}
+  send(value){return this._sendTo(this.process,value);}
+  _touch(){clearTimeout(this.idleTimer);this.idleTimer=null;if(this.idleMs>0){this.idleTimer=setTimeout(()=>this._recycle(),this.idleMs);this.idleTimer.unref?.();}}
+  _recycle(){if(this.closed||!this.process)return;if(this.current&&!this.current.done){this._touch();return;}this._retire(this.process);}
   get failureMessage(){return this.failure;}
-  // 立即打断当前朗读（不销毁进程），通话里「听到用户开口就住口」用它。
-  interrupt(reason){const stream=this.current;if(!stream||stream.done)return false;stream.interrupt(reason||Error('声音被打断。'));return true;}
+  interrupt(reason){if(!this.current||this.current.done)return false;this.current.interrupt(reason||Error('声音被打断。'));return true;}
   get speaking(){return !!(this.current&&!this.current.done);}
-  // 插件卸载时调用，别留下孤儿 PowerShell 进程。
-  async dispose(){this.closed=true;clearTimeout(this.idleTimer);this.idleTimer=null;if(this.current&&!this.current.done)this.current.interrupt(Error('语音插件已卸载。'));this._kill();}
+  async dispose(){this.closed=true;clearTimeout(this.idleTimer);this.idleTimer=null;if(this.current&&!this.current.done)this.current.interrupt(Error('语音插件已卸载。'));if(this.process)this._retire(this.process);}
   async play(bytes,signal){const audio=parseWave(bytes),stream=this.createStream(audio.sampleRate,signal);await stream.writePCM(audio.pcm);await stream.finish();}
 }

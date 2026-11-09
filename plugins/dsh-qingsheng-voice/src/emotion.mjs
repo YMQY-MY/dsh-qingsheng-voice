@@ -7,7 +7,7 @@ const asset=JSON.parse(await readFile(new URL('./emotion-assets.json',import.met
 const clone=value=>structuredClone(value),hash=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,24);
 export function stripEmotionMarkers(source){const text=source.replace(/\[情绪:[^\]\r\n]{1,80}\]/g,'');if(text.includes('[情绪:'))throw Error('情绪标记格式无效。');return text;}
 export const emotionLabels={neutral:'中性陪伴',surprise:'惊讶',proud:'小得意',shy:'害羞',tsundere:'嘴硬',curious:'好奇',hungry:'馋嘴',confused:'困惑',sad:'低落',comfort:'安慰',work:'认真工作',panic:'紧急提醒',playful:'调皮'};
-const defaults={enabled:true,mode:'auto',preset:'neutral',strength:.45,maxStrength:.65,continuity:.72,signature:true,serious:false,automationVersion:1};
+const defaults={enabled:true,mode:'auto',preset:'neutral',strength:.45,maxStrength:.85,continuity:.72,signature:true,serious:false,automationVersion:1};
 const fields={rate:[.75,1.25],pitch_offset_st:[-3,3],pitch_range_st:[.5,5],breathiness:[0,.4],intensity:[0,1]};
 function number(value,min,max,name){if(typeof value!=='number'||!Number.isFinite(value)||value<min||value>max)throw Error(name+'超出支持范围。');return value;}
 function text(value,max,name){if(typeof value!=='string'||!value.trim()||value.length>max)throw Error(name+'无效。');return value.trim();}
@@ -120,15 +120,62 @@ export class EmotionController{
     if(result.some(s=>s.text.includes('[情绪:')))throw Error('情绪标记格式无效，请使用 [情绪:comfort:0.5]。');
     return result.filter(s=>s.text.trim());
   }
-  plan(source,sessionId,{override,replay=false}={}){
+  // 把 WhaleSpeak 的 emphasis 折成一句普通话指令。
+  // 只在拿得到字符位置时才说，且最多点三个词——点太多等于没点。
+  _emphasisHint(override){
+    const list=override?.emphasis;
+    if(!Array.isArray(list)||!list.length) return '';
+    // 不能把 WhaleSpeak 给的 emphasis 原文直接写进指令：
+    // 它的 text 可能是整句（"哦鲸鲸也饿"），也可能带 [情绪:xx] 内部标记，
+    // 一旦写进去 TTS 会照着念出来（实测 direction 里出现过 "[情绪:hungry:0.9]、哦鲸鲸、也饿"）。
+    const clean=w=>String(w||'')
+      .replace(/\[情绪:[^\]\r\n]*\]/g,'')       // 内部情绪标记，绝不能念
+      .replace(/[\r\n]/g,'')
+      .trim();
+    const words=list.map(e=>clean(e?.text)).filter(w=>{
+      if(!w) return false;
+      const n=[...w].length;
+      // 太短（单字）没有强调意义；中文里要重读的词极少超过 4 字，
+      // 5 字以上基本是整句（实测「哦鲸鲸也饿」5 字就是整句，点了等于整句加重）
+      if(n<2 || n>4) return false;
+      // 带分句标点的必是整句片段
+      if(/[，。！？!?,、；;…—]/.test(w)) return false;
+      return true;
+    }).slice(0,3);
+    if(!words.length) return '';
+    return '这几个词读得稍重一点、稍慢一点，其余保持自然：' + words.join('、') + '。';
+  }
+
+  // 强度整形成「低段照实、高段渐收」，而不是一刀切上限。
+  // 原来 Math.min(strength, 0.65) 的问题是：她标 0.7 和标 1.0 听起来一模一样，
+  // 高情绪全被压成同一个值，反而失去了表达力；而中性句又挤在 0.3 附近
+  // 抬不起来。整形后曲线连续单调：标多少都能听出差别，只是越高越收敛，
+  // 避免 1.0 时夸张到不像同一个人。
+  shapeStrength(value){
+    const v=Math.max(0,Math.min(1,Number(value)||0));
+    if(v<=0)return 0;
+    const max=Math.max(.3,Math.min(1,this.config.maxStrength??.85));
+    // 低段保持线性、不压缩：0.1 就该是 0.1，各档之间要拉开差距，
+    // 否则前几档会挤成同一个值（试过抬底版，0.1~0.5 听起来几乎一样）。
+    // 真正需要处理的是上限那一头：
+    // 原来 Math.min(v, 0.65) 让标 0.7 和标 1.0 完全一样，高情绪被压平；
+    // 这里改成接近上限时用 1-e^-x 渐收，永远不硬撞顶，
+    // 既保住 0.7/0.8/0.9/1.0 的区分度，又不会夸张到不像同一个人。
+    const knee=max*.75;
+    if(v<=knee)return v;
+    const room=max-knee;
+    const t=(v-knee)/Math.max(1e-6,1-knee);
+    return Math.max(0,Math.min(1,knee+room*(1-Math.exp(-2.2*t))/(1-Math.exp(-2.2))));
+  }
+  plan(source,sessionId,{override,replay=false,previousState,continuation=false}={}){
     if(typeof source!=='string'||source.length>12000)throw Error('情绪文本最多 12000 字。');if(typeof sessionId!=='string'||sessionId.length>160)throw Error('会话无效。');
     const version=hash([this.profile,this.config]),previous=this.lastPlans.get(sessionId);
-    if(replay&&previous?.source===source&&previous.version===version)return{...clone(previous.plan),replay:true};
-    const original=this.sessions[sessionId]||{turn:0,strength:0,envelope:clone(this.profile.default),preset:'neutral',signatures:{}};
-    const next=clone(original),clauses=this.parse(source,override),segments=[];let used=0,signatureChars=0;const turn=original.turn+1,total=clauses.reduce((sum,s)=>sum+s.text.length,0);
+    if(replay&&!previousState&&previous?.source===source&&previous.version===version)return{...clone(previous.plan),replay:true};
+    const original=previousState||this.sessions[sessionId]||{turn:0,strength:0,envelope:clone(this.profile.default),preset:'neutral',signatures:{}};
+    const next=clone(original),clauses=this.parse(source,override),segments=[];let used=0,signatureChars=0;const turn=original.turn+(continuation?0:1),total=clauses.reduce((sum,s)=>sum+s.text.length,0);
     for(const clause of clauses){
       const id=this.config.serious?'work':clause.preset,preset=this.profile.emotion_presets[id]||this.profile.emotion_presets.neutral;
-      const strength=Math.min(clause.strength??this.config.strength,this.config.maxStrength),serious=this.config.serious||clause.serious||['work','panic','sad','comfort'].includes(id);
+      const strength=this.shapeStrength(clause.strength??this.config.strength),serious=this.config.serious||clause.serious||['work','panic','sad','comfort'].includes(id);
       const target={};for(const key of Object.keys(fields))target[key]=this.profile.default[key]+(preset[key]-this.profile.default[key])*strength;
       target.pause_ms=preset.pause_ms.map((v,i)=>this.profile.default.pause_ms[i]+(v-this.profile.default.pause_ms[i])*strength);
       for(const chunk of splitSpeech(steadyText(clause.text))){
@@ -154,7 +201,11 @@ export class EmotionController{
         const appliedStrength=next.strength;
         const force=appliedStrength<.25?'情绪非常轻，接近中性':appliedStrength<.6?'情绪适度，避免表演化':'情绪较明显，仍保持清晰和同一声纹';
         const performance=asset.signatures.find(s=>s.emotion===id)?.intended_effect;
-        const instruction=['固定当前参考声纹，保持同一说话人。普通话清楚，保留汉字声调；不夹嗓，不持续高扬尾音。',strength===0?'中性清楚地朗读，不额外演绎。':id+'（'+(emotionLabels[id]||id)+'）：'+preset.direction+'。',force+'，'+rate+'；前后语气平滑承接。',serious?'以事实与指令可懂度为先，减少装饰语气，不卖萌、不夸张哭笑。':'气息轻微，辅音完整，句尾自然收拢。',signature?'仅对原文已有的“'+signature+'”轻度演绎：'+(performance||'自然、短促')+'，不额外插入口癖。':'原文口癖按普通文字清楚读出，不额外加强或插入。'].join('');
+        // WhaleSpeak 会给出这段里该重读的字（emphasis），原来整条链路把它丢了，
+        // 下游只能整句一个力度念。这里把它折进 direction：TTS 只认自然语言指令，
+        // 没有 emphasis 参数位，所以必须翻译成「哪几个字读重一点」。
+        const emphHint=this._emphasisHint?.(override)||'';
+        const instruction=['固定当前参考声纹，保持同一说话人。普通话清楚，保留汉字声调；不夹嗓，不持续高扬尾音。',strength===0?'中性清楚地朗读，不额外演绎。':id+'（'+(emotionLabels[id]||id)+'）：'+preset.direction+'。',force+'，'+rate+'；前后语气平滑承接。',...(emphHint?[emphHint]:[]),serious?'以事实与指令可懂度为先，减少装饰语气，不卖萌、不夸张哭笑。':'气息轻微，辅音完整，句尾自然收拢。',signature?'仅对原文已有的“'+signature+'”轻度演绎：'+(performance||'自然、短促')+'，不额外插入口癖。':'原文口癖按普通文字清楚读出，不额外加强或插入。'].join('');
         segments.push({text:chunk,preset:id,label:emotionLabels[id]||id,strength,appliedStrength,serious,hardTransition:hard,signature:signature||null,designTarget:clone(target),smoothedTarget:clone(next.envelope),instruction:instruction+(hard?'允许本次紧急切换。':'从'+(emotionLabels[from]||from)+'的余韵逐渐过渡，不突然换说话方式。')});
         if(segments.length>80)throw Error('情绪分段过多，单次最多 80 段。');
       }
@@ -187,7 +238,9 @@ export class EmotionController{
       }
       joined.push({...seg});
     }
-    const plan={id:hash([version,joined]),text:joined.map(s=>s.text).join(''),segments:joined,mode:override?'preview':this.config.mode,method:this.config.mode==='auto'?'deterministic-semantic-v1':'text-instruction',revision:this.revision,sessionId,source,version,nextState:next,replay};
+    // text 是要拿去朗读的正文，标记只用于表达情绪，绝不能念出来。
+    // 每段单独剥：这样段与段之间的边界仍然保留，不会把两段的字黏在一起。
+    const plan={id:hash([version,joined]),text:joined.map(s=>stripEmotionMarkers(s.text)).join(''),segments:joined.map(s=>({...s,text:stripEmotionMarkers(s.text)})),mode:override?'preview':this.config.mode,method:this.config.mode==='auto'?'deterministic-semantic-v1':'text-instruction',revision:this.revision,sessionId,source,version,nextState:next,replay};
     return plan;
   }
   preview(source,sessionId,options){const plan=this.plan(source,sessionId,options);this.lastPlan=this.display(plan);return this.lastPlan;}

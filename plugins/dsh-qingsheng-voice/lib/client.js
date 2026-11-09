@@ -47,8 +47,15 @@ window.__ModuleLoader__.load({id:'dsh-qingsheng-voice',factory:(require) => {
     useEffect(()=>{let alive=true,busy=false;const poll=async()=>{if(busy)return;busy=true;try{const s=await call({action:'status'});if(alive){setStatus(s);setError('');}}catch(e){if(alive)setError(e.message);}finally{busy=false;}};poll();const timer=setInterval(poll,700);return()=>{alive=false;clearInterval(timer);};},[call]);
     return {status,error,setStatus};
   }
-  function VoiceControls({sessionId,inputActions,locked,onActiveChange,call}) {
+  function VoiceControls({sessionId,inputActions,locked,onActiveChange,call,extra,subscribeExtra}) {
     const {status,error:connectionError,setStatus}=useStatus(call);
+    // 通话插件可能在组件渲染之后才把按钮加进来，所以订阅一次，免得拿到的是空快照。
+    const [liveExtra,setLiveExtra]=useState(Array.isArray(extra)?extra:[]);
+    useEffect(()=>{
+      if(typeof subscribeExtra!=='function') return;
+      return subscribeExtra(()=>setLiveExtra(Array.isArray(extra)?extra.slice():[]));
+    },[]);
+    const shownExtra = Array.isArray(liveExtra)&&liveExtra.filter(Boolean).length ? liveExtra.filter(Boolean) : (Array.isArray(extra)?extra.filter(Boolean):[]);
     const [phase,setPhase]=useState('idle'),[error,setError]=useState(''),[level,setLevel]=useState(0),[pending,setPending]=useState(''),[savingAuto,setSavingAuto]=useState(false);
     const active=useRef(null),generation=useRef(0),alive=useRef(true);
     const [showStudio,setShowStudio]=useState(false),[showPanel,setShowPanel]=useState(false),[showEmotion,setShowEmotion]=useState(false),[showHistory,setShowHistory]=useState(false),[history,setHistory]=useState([]);
@@ -96,6 +103,7 @@ window.__ModuleLoader__.load({id:'dsh-qingsheng-voice',factory:(require) => {
       actionButton(status?.phase==='paused'?'继续':busyPlaying?'暂停':'朗读',()=>playback(status?.phase==='paused'?'resume':busyPlaying?'pause':'replay'),{disabled:!compatible||!status?.connected||!status?.engine?.ready,'aria-label':status?.phase==='paused'?'继续朗读':busyPlaying?'暂停朗读':'朗读或重播最新回复'}),
       busyPlaying&&actionButton('■',stopVoice,{'aria-label':'停止大肥鱼朗读',title:'停止朗读'}),
       h('button',{type:'button',style,onClick:openPanel,'aria-label':'更多语音设置','aria-haspopup':'dialog','aria-expanded':showPanel,title:health},h('span',{className:'qs-health-dot','data-warning':mismatch||!!feedback||!status?.connected||!status?.engine?.ready}),'更多'),
+      Array.isArray(shownExtra)&&shownExtra.length>0&&shownExtra.map((item,i)=>h('span',{key:'qs-extra-'+i,style:{display:'inline-flex'}},item)),
       pending&&actionButton('插入识别结果',()=>{if(inputActions.insertText(pending,inputActions.captureInsertion())){setPending('');setError('');}}),
       showPanel&&h(ControlsDialog,{onClose:()=>setShowPanel(false)},
         h('p',{role:'status'},health),
@@ -343,7 +351,30 @@ window.__ModuleLoader__.load({id:'dsh-qingsheng-voice',factory:(require) => {
 
   function apply(ctx) {
     const call=async(input,signal)=>{const r=await ctx.connection.rpc.call('/api','qingsheng/control',input,signal);if(!r.ok){const message=r.error?.message||'语音插件连接失败。';throw Error(message.includes('未知语音操作')?'插件界面与后台版本不同，请在 DSH 中重新加载清声插件或重启 DSH。':message);}return r.value;};
-    ctx.slots.inject('conversation.input.activity',()=>ctx.slots.register({name:'conversation.input.activity',inject:()=>({call})},VoiceControls));
+    // 扩展点：其它插件（如通话）把按钮挂进这条工具栏，而不是抢占同一个插槽把整组按钮替换掉。
+    const extras=[];
+    const listeners=new Set();
+    const notify=()=>{ for(const fn of listeners) { try{ fn(); }catch{} } };
+    const subscribe=fn=>{ listeners.add(fn); return ()=>listeners.delete(fn); };
+    const extraApi=Object.freeze({
+      subscribe,
+      add:render=>{if(typeof render!=='function')throw Error('按钮必须是渲染函数。');const id={n:extras.length};extras.push(render);notify();return id;},
+      remove:id=>{if(id&&typeof id.n==='number'){extras[id.n]=null;notify();}},
+    });
+    // 扩展点：通话插件把按钮挂进这条工具栏，而不是抢占同一个插槽。
+    // 用 ctx.provide 注册服务（DSH 客户端没有 ctx.set），第三个参数 check 必须给，
+    // 否则 ctx.inject 侧可能判定为不可用而永远等不到。
+    // provide 内部只在 fiber.state===2 时 notify 等待者；直接在 apply 里调用可能早于 fiber 激活，
+    // 导致 ctx.inject 侧永远收不到通知。所以放进 ctx.effect 里注册。
+    const registerExtra = () => {
+      try { ctx.provide('qingshengVoiceToolbar', extraApi, () => true); }
+      catch (e) { ctx.logger?.warn?.('扩展点注册失败：' + e.message); }
+    };
+    try {
+      if(typeof ctx.effect === 'function') ctx.effect(registerExtra);
+      else registerExtra();
+    } catch (e) { ctx.logger?.warn?.('扩展点注册失败：' + e.message); }
+    ctx.slots.inject('conversation.input.activity',()=>ctx.slots.register({name:'conversation.input.activity',inject:()=>({call,extra:Array.isArray(extras)?extras.filter(Boolean):[],subscribeExtra:subscribe})},VoiceControls));
     ctx.slots.inject('plugins.bundle.config',()=>ctx.slots.register({name:'plugins.bundle.config',key:'dsh-qingsheng-voice',inject:()=>({call})},VoiceSettings));
   }
   return {apply,inject:['connection','slots']};

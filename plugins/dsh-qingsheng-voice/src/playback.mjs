@@ -3,7 +3,8 @@ import {createHash} from 'node:crypto';
 import path from 'node:path';
 import {spokenText,splitSpeech} from './text.mjs';
 import {steadyText,calibrationText,mouthPause} from './delivery.mjs';
-import {stripEmotionMarkers} from './emotion.mjs';
+import {stripEmotionMarkers, inferEmotion} from './emotion.mjs';
+import {WhaleSpeakBridge, PRESET_TO_EMOTION, refineStrength} from './whalespeak-bridge.mjs';
 export class ConversationPlayback {
   constructor(){this.lastAnswers=new Map();this.replyHistory=new Map();this.voiceLocks={};this.audioCache=new Map();this.lockSaves=Promise.resolve();this.paused=false;this.positionSeconds=0;this.totalSeconds=0;}
   async loadPlayback(){
@@ -20,14 +21,20 @@ export class ConversationPlayback {
     if(this.lastAnswers.size>30)this.lastAnswers.delete(this.lastAnswers.keys().next().value);return item;
   }
   // 段落之间的过渡停顿：情绪差距越大停得越久，让下一段有起音空间，避免硬切。
+  // 段与段之间必须留换气间隙。原来 plan 为空时直接 return 0，
+  // 调用处又是 if(pause>0) 才插静音，于是两段只剩 12ms 淡出接 12ms 淡入硬拼，
+  // 听感就是「上一句还没收尾下一句就响了」（用户实测偶发）。
+  // 现在无论有没有 plan 都给一个下限，没有情绪计划时也不能贴在一起。
   transitionPause(previous,current,plan){
-    if(!plan?.segments)return 0;
+    if(!previous)return 0;
+    // 段间下限：低于 80ms 人耳会判成一句话被硬接
+    const floor=80;
     const a=previous?.preset,b=current?.preset;
-    if(!a||!b)return 0;
-    if(a===b)return 140;
+    if(!plan?.segments||!a||!b)return floor;
+    if(a===b)return Math.max(floor,140);
     const diff=Math.max(Math.abs((previous.appliedStrength??previous.strength??0)-(current.appliedStrength??current.strength??0)),0.12);
-    if(current.hardTransition||previous.hardTransition)return 90;
-    return Math.round(Math.min(520,220+diff*1400));
+    if(current.hardTransition||previous.hardTransition)return Math.max(floor,90);
+    return Math.round(Math.min(520,Math.max(floor,220+diff*1400)));
   }
   // 段尾不落在零点、下一段又从满幅起音，直接拼会「咔」；
   // 对交界两侧各做 12ms 余弦淡出/淡入，才是自然的换气而不是被剪断。
@@ -91,30 +98,107 @@ export class ConversationPlayback {
     if(typeof text!=='string'||!text.trim()||text.length>180)throw Error('试听台词需要 1–180 字。');
     this.speak(text,{voiceId:id,preview:true});return{started:true};
   }
+  // 判定可以被打断，也有硬预算：默认最多等 whaleSpeak.budgetMs（0.6s），
+  // 超时就用清声原强度先播——网络再慢也不能让朗读停摆。
+  async waitJudgment(text,tone,emotion,signal){
+    if(!this.whaleSpeak?.enabled) return null;
+    const pending=this.whaleSpeak.judge(text,tone,emotion);
+    const budget=Number(this.whaleSpeak.budgetMs)||600;
+    const stoppers=[new Promise(resolve=>setTimeout(()=>resolve(null),budget))];
+    if(signal){
+      if(signal.aborted) return null;
+      stoppers.push(new Promise(resolve=>{
+        signal.addEventListener('abort',()=>resolve(null),{once:true});
+      }));
+    }
+    return Promise.race([pending,...stoppers]);
+  }
+  async speechEmotionPlan(spoken,options={},signal){
+    let override=options.emotionOverride;
+    // 「[情绪:xx]」是她自己给出的心情，比任何关键词表都准，优先级最高。
+    // 有标记时整个绕过 WhaleSpeak：让 plan 走 auto 模式解析标记。
+    // 注意不能只把 override 置 undefined —— 下面判断 !override 就成立了，
+    // WhaleSpeak 会照样跑并重新把 override 赋回来（踩过一次）。
+    const hasMark=/\[情绪:[a-z_]+(?:[:：][^\]]*)?\]/.test(spoken);
+    if(!hasMark&&!override&&this.whaleSpeak?.enabled){
+      try{
+        const base=inferEmotion(spoken),emotion=PRESET_TO_EMOTION[base.preset];
+        const judgment=await this.waitJudgment(spoken,options.tone,emotion,signal);
+        if(judgment){
+          // emphasis 一并带下去：引擎已经算好哪几个字该重读，
+          // 不带的话这段信息到这就断了，TTS 只能整句一个力度。
+          override={...base,strength:refineStrength(spoken,base,judgment),emphasis:judgment.emphasis};
+          this.whaleSpeak.stats.applied++;
+        }else{
+          // 判不动就退回清声原强度，绝不卡住播放。
+          this.whaleSpeak.stats.skipped++;
+        }
+      }catch(error){this.whaleSpeak.stats.skipped++;this.whaleSpeak.lastError=String(error.message||error);}
+    }
+    return this.emotion.plan(spoken,this.focus||'local',{
+      override,replay:!!options.replay,previousState:options.previousState,continuation:!!options.continuation,
+    });
+  }
   startPlayback(text,options={}){
     this.stop();this.error='';this.warning='';
+    const player=options.player||this.player;
     const useEmotion=!options.preview&&(this.emotion.config.enabled||options.emotionPreview);
     const delivery=options.preview?'reference':useEmotion?'steady':this.preferences.delivery;
-    const spoken=spokenText(text),knownReply=[...(this.replyHistory.get(this.focus)||[])].reverse().find(item=>item.text===spoken),replyId=options.replyId||knownReply?.id,emotionPlan=useEmotion?this.emotion.plan(spoken,this.focus||'local',{override:options.emotionOverride,replay:!!options.replay}):null;
-    const unmarked=emotionPlan?.text??stripEmotionMarkers(spoken),clean=mouthPause(delivery==='steady'?steadyText(unmarked):unmarked);if(!clean)return Promise.resolve();
+    const spoken=spokenText(text),knownReply=[...(this.replyHistory.get(this.focus)||[])].reverse().find(item=>item.text===spoken),replyId=options.replyId||knownReply?.id;
+    // 清声本地规划与 WhaleSpeak 缓存同步完成；新判定在后台补，不阻塞首音。
+    // 同步段不能 await（speak() 直接返回本函数的返回值，测试与打断依赖同步时序），
+    // 但播放本身是异步的，所以把计算挪进 promise 里，首遍朗读就能吃到判定。
+    let emotionPlan=null;
+    const spokenRaw=spoken;
+    const unmarked=stripEmotionMarkers(spoken);
+    let clean=mouthPause(delivery==='steady'?steadyText(unmarked):unmarked);
+    if(!clean)return Promise.resolve();
     const controller=new AbortController(),generation=this.generation,signal=controller.signal;this.controller=controller;
+    const following=options.followingPhrases;
+    const cancelFollowing=()=>{void following?.return?.();};
+    if(following)signal.addEventListener('abort',cancelFollowing,{once:true});
+    let heardText=clean;
     const focus=this.focus,voiceId=options.voiceId||this.preferences.voiceId;this.positionSeconds=0;this.totalSeconds=0;this.firstAudioMs=null;
     const preview=options.preview?{voiceId,status:'generating',jobId:null}:null;if(preview)this.preview=preview;
     const started=Date.now();
     const promise=(async()=>{
       try{
-        if(!this.player.createStream){
-          for(const segment of splitSpeech(clean)){signal.throwIfAborted();this.phase='generating';const bytes=await this.studio.synthesize(segment,voiceId,signal);signal.throwIfAborted();this.phase='playing';await this.player.play(bytes,signal);}return;
+        // 清声定基调与安全阀，WhaleSpeak 的已有判定补 valence/arousal 强度；
+        // 通话和普通朗读都走原有语气链，缓存未命中时不 await 网络。
+        if(useEmotion){
+          signal.throwIfAborted();
+          // 首段合成必须保持同步时序（stop/打断依赖它），所以这里不排队等网络：
+          // 命中已判好的结果就直接用，没命中就先按清声原强度播，
+          // 判定在后台补、同时喂给下一句。bridge 在 assistant/message 时已提前发起，
+          // 正常对话里到这一步基本都已就绪。
+          // 解析情绪必须用带标记的原文：「[情绪:hungry:0.9]」是她在告诉我们
+          // 这句话什么心情，剥早了就只剩关键词兜底，标记还会被当正文念出来。
+          // 取到 plan 之后，plan.text 自己已经不含标记。
+          const plan=await this.speechEmotionPlan(spokenRaw,options,signal);
+          if(this.generation!==generation||signal.aborted)return;
+          emotionPlan=plan;
+          if(emotionPlan?.text){const t=mouthPause(delivery==='steady'?steadyText(emotionPlan.text):emotionPlan.text);if(t)clean=t;}
+          heardText=clean;
+        }
+        if(!player.createStream){
+          // 降级路径（无流式播放器）也要带情绪，否则情绪在实际环境里完全不生效。
+          const fallbackParts=emotionPlan?.segments||splitSpeech(clean).map(text=>({text}));
+          for(const part of fallbackParts){
+            signal.throwIfAborted();this.phase='generating';
+            const bytes=await this.studio.synthesize(part.text,voiceId,signal,()=>{},{direction:part.instruction});
+            signal.throwIfAborted();this.phase='playing';await player.play(bytes,signal);
+          }
+          return;
         }
         this.phase='generating';const state=await this.studio.state(signal),voice=state.voices.find(v=>v.id===voiceId)||state.voices[0];
         if(!voice)throw Error('请先导入或设计一个音色。');if(!state.engine?.ready)throw Error('声音模型尚未就绪，请先启动清声。');
         const key=this.voiceKey(voice,delivery==='steady'),cacheKey=focus+':'+(replyId||'live')+':'+key+':'+(replyId?'historical':emotionPlan?.id||'plain')+':'+clean;
-        const cached=!preview&&!options.emotionPreview&&this.audioCache.get(cacheKey);let stream,rate,stored=[],storedBytes=0,cacheable=true;
+        const cached=!following&&!preview&&!options.emotionPreview&&this.audioCache.get(cacheKey);let stream,rate,stored=[],storedBytes=0,cacheable=true;
         const receive=async(bytes,sampleRate)=>{
           signal.throwIfAborted();
-          if(!stream){rate=sampleRate;stream=this.player.createStream(rate,signal,position=>{if(this.generation===generation)this.positionSeconds=position;});this.output=stream;if(this.paused)stream.pause();}
+          if(!stream){rate=sampleRate;stream=player.createStream(rate,signal,position=>{if(this.generation===generation)this.positionSeconds=position;});this.output=stream;if(this.paused)stream.pause?.();}
           if(rate!==sampleRate)throw Error('音频采样率改变，请停止后重试。');
-          if(this.firstAudioMs===null){await stream.ready;this.firstAudioMs=Date.now()-started;}
+          if(this.firstAudioMs===null){await stream.ready;signal.throwIfAborted();this.firstAudioMs=Date.now()-started;options.onFirstAudio?.({firstAudioMs:this.firstAudioMs});}
           this.phase=this.paused?'paused':'playing';this.totalSeconds+=bytes.length/(rate*2);
           if(cacheable){storedBytes+=bytes.length;if(storedBytes>40*1024*1024){cacheable=false;stored=[];}else stored.push(bytes);}
           await stream.writePCM(bytes);
@@ -133,8 +217,29 @@ export class ConversationPlayback {
           // 逐段串行合成播放。此前试过预取（并行生成下一段），但清声一次只跑一个任务、
           // 并行只会把音频堆在内存里，还引入过未捕获 rejection 导致插件崩溃，已撤回。
           let previousPart=null;
-          const parts=emotionPlan?.segments||(preview?[clean]:splitSpeech(clean)).map(text=>({text}));
-          for(const part of parts){
+          const initialParts=emotionPlan?.segments||(preview?[clean]:splitSpeech(clean)).map(text=>({text}));
+          // A single consumer synthesizes the next phrase while the same native
+          // stream plays queued PCM. No parallel TTS jobs and no per-phrase drain.
+          const playback=this;
+          const parts=following?(async function*(){
+            yield* initialParts;
+            for await(const phrase of following){
+              signal.throwIfAborted();
+              const phraseSpoken=spokenText(phrase);
+              const plan=useEmotion?await playback.speechEmotionPlan(phraseSpoken,{
+                ...options,previousState:emotionPlan?.nextState,continuation:true,
+              }):null;
+              const spoken=plan?.text||stripEmotionMarkers(phraseSpoken);
+              const next=mouthPause(delivery==='steady'?steadyText(spoken):spoken);
+              if(!next)continue;
+              heardText+=next;
+              if(plan){
+                emotionPlan={...plan,source:emotionPlan.source+phraseSpoken,text:emotionPlan.text+plan.text,segments:[...emotionPlan.segments,...plan.segments]};
+                yield* plan.segments;
+              }else for(const text of splitSpeech(next))yield{text};
+            }
+          })():initialParts;
+          for await(const part of parts){
             signal.throwIfAborted();
             if(previousPart&&rate){
               const pause=this.transitionPause(previousPart,part,emotionPlan);
@@ -180,16 +285,16 @@ export class ConversationPlayback {
             const name=`${stamp}-${(replyId||'live').toString().replace(/[^\w.-]/g,'').slice(0,48)}.wav`;
             const txt=path.join(outDir,name.replace(/\.wav$/,'.txt'));
             await fs.writeFile(path.join(outDir,name),Buffer.concat([hdr,pcm]));
-            await fs.writeFile(txt,clean,'utf8');
+            await fs.writeFile(txt,heardText,'utf8');
             const all=(await fs.readdir(outDir)).filter(n=>n.endsWith('.wav')).sort();
             for(const old of all.slice(0,Math.max(0,all.length-40-1))){await fs.unlink(path.join(outDir,old)).catch(()=>{});await fs.unlink(path.join(outDir,old.replace(/\.wav$/,'.txt'))).catch(()=>{});}
-            this.lastHeard={file:path.join(outDir,name),text:clean,seconds:+(pcm.length/(rate*2)).toFixed(2)};
+            this.lastHeard={file:path.join(outDir,name),text:heardText,seconds:+(pcm.length/(rate*2)).toFixed(2)};
           }catch(e){this.warning='音频回存失败：'+e.message;}
         }
         if(emotionPlan){this.emotion.lastPlan=this.emotion.display(emotionPlan);if(!options.emotionPreview)await this.emotion.commit(emotionPlan);}
-        if(!preview&&!options.emotionPreview&&!cached&&cacheable){this.audioCache.set(cacheKey,{chunks:stored,rate});while(this.audioCache.size>2)this.audioCache.delete(this.audioCache.keys().next().value);}
+        if(!following&&!preview&&!options.emotionPreview&&!cached&&cacheable){this.audioCache.set(cacheKey,{chunks:stored,rate});while(this.audioCache.size>2)this.audioCache.delete(this.audioCache.keys().next().value);}
       }catch(e){if(!signal.aborted){this.error=e.message;this.phase='error';if(preview){preview.status='failed';preview.error=e.message;}controller.abort(e);}}
-      finally{if(this.generation===generation){this.controller=null;this.output=null;this.paused=false;if(!this.error)this.phase='idle';}}
+      finally{signal.removeEventListener('abort',cancelFollowing);if(following)await following.return?.();if(this.generation===generation){this.controller=null;this.output=null;this.paused=false;if(!this.error)this.phase='idle';}}
     })();
     this.active.add(promise);promise.finally(()=>this.active.delete(promise));return promise;
   }

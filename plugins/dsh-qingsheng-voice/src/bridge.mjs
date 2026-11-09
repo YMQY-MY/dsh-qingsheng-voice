@@ -5,6 +5,8 @@ import { NativePlayer } from './pcm-player.mjs';
 import {ConversationPlayback} from './playback.mjs';
 import { assistantText, assistantHistory, spokenText, splitSpeech } from './text.mjs';
 import {EmotionController} from './emotion.mjs';
+import {WhaleSpeakBridge, loadWhaleSpeakConfig, PRESET_TO_EMOTION} from './whalespeak-bridge.mjs';
+import {inferEmotion} from './emotion.mjs';
 export class VoiceBridge extends ConversationPlayback {
   constructor(config, {studio,player,readLatest,readHistory} = {}) {
     super();this.readLatest=readLatest;this.readHistory=readHistory;
@@ -19,7 +21,11 @@ export class VoiceBridge extends ConversationPlayback {
     await mkdir(this.config.dataRoot,{recursive:true});
     this.file = path.join(this.config.dataRoot,'preferences.json');
     try { this.updatePreferences(JSON.parse(await readFile(this.file,'utf8'))); } catch(e) { if(e.code !== 'ENOENT') this.error = '偏好文件无法读取，本次使用默认值。'; }
-    await this.loadPlayback();await this.emotion.init();return this;
+    await this.loadPlayback();
+    this.whaleSpeak=new WhaleSpeakBridge(loadWhaleSpeakConfig(this.config.dataRoot)).warm(this.config.dataRoot);
+    // 探活发起即可：judge 内部会把并发探活合并成一次，不会每条都等 600ms。
+    this.whaleSpeak.probe().catch(()=>{});
+    await this.emotion.init();return this;
   }
   updatePreferences(value) {
     if(['steady','reference'].includes(value.delivery))this.preferences.delivery=value.delivery;
@@ -47,17 +53,23 @@ export class VoiceBridge extends ConversationPlayback {
     if(event.type === 'assistant/message') {
       const text = assistantText(event);
       if(text)this.pending.set(id,text); else this.pending.delete(id);
+      // 文本一到就先问 WhaleSpeak：判定的 0.6 秒藏进「等 turn/end + TTS 出首音」
+      // 这段本来就在等的时间里，到真正朗读时结果通常已经就绪。
+      if(text&&this.preferences.autoSpeak&&this.callSessionId!==id&&this.whaleSpeak?.enabled){
+        const base=inferEmotion(text);
+        this.whaleSpeak.prefetch(text,undefined,PRESET_TO_EMOTION[base.preset]);
+      }
     }
     if(event.type === 'turn/end') {
       const text = this.pending.get(id); this.pending.delete(id);
-      if(text && event.data?.reason?.kind === 'completed'){const messageId=event.data?.messageId||event.data?.message?.id||event.data?.id||event.seq;this.rememberReply(text,{id:String(messageId||`${id}-${event.seq||Date.now()}`)});if(this.preferences.autoSpeak)this.speak(text,{replyId:String(messageId||`${id}-${event.seq||Date.now()}`)});}
+      if(text && event.data?.reason?.kind === 'completed'){const messageId=event.data?.messageId||event.data?.message?.id||event.data?.id||event.seq;this.rememberReply(text,{id:String(messageId||`${id}-${event.seq||Date.now()}`)});if(this.callSessionId !== id && this.preferences.autoSpeak)this.speak(text,{replyId:String(messageId||`${id}-${event.seq||Date.now()}`)});}
     }
   }
   stop() {
     return this.stopPlayback();
   }
   interrupt(reason) {
-    return this.interruptPlayback(reason);
+    return super.interrupt(reason);
   }
   // 通话插件用的「谁在说话」快照：它在不在出声、卡在哪一相位。
   get speechState() {
