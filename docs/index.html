@@ -78,11 +78,12 @@
   <header>
     <div class="mark">🐋</div>
     <h1>给 AI 一副本地的嗓子</h1>
-    <p class="sub">清声是 DeepSeek-Harness 的语音插件：回答自动朗读、麦克风转文字、音色随你捏。全部在你自己的机器上跑，不联网、不上传、不按次计费。</p>
+    <p class="sub">清声是 DeepSeek-Harness 的语音插件：回答自动朗读、对着麦克风说话、还能直接打电话。音色随你捏，全部在你自己的机器上跑，不联网、不上传、不按次计费。</p>
     <div class="badges">
       <span class="badge">全本机运行</span>
       <span class="badge">音色克隆</span>
       <span class="badge">流式播放</span>
+      <span class="badge">实时通话</span>
       <span class="badge alt">Windows x64 · Vulkan</span>
     </div>
     <div class="cta">
@@ -96,6 +97,7 @@
     <div class="grid two">
       <div class="card"><span class="ic">🔊</span><h3>边生成边朗读</h3><p>回答还在写的时候就开口，不必等整段合成完。长回答也不会让你干等着。</p></div>
       <div class="card"><span class="ic">🎙️</span><h3>对着机器说话</h3><p>录音转文字直接进输入框，确认之后才发送。识别在本机完成，音频不出门。</p></div>
+      <div class="card"><span class="ic">📞</span><h3>直接打电话</h3><p>点一下电话按钮就开始通话，你说完它接话，说完再轮到你。麦克风采集、断句、识别、轮次都在本机完成。</p></div>
       <div class="card"><span class="ic">🎭</span><h3>音色随你捏</h3><p>内嵌工作台可以录参考音锁定音色，也可以直接用文字描述你想要的声音。</p></div>
       <div class="card"><span class="ic">💬</span><h3>说话有情绪</h3><p>按语义切换语气，停顿、口癖、尾音都落在台词层，听起来像人在讲而不是机器在念。</p></div>
     </div>
@@ -115,7 +117,7 @@
   <section>
     <h2>环境与体积</h2>
     <dl class="spec">
-      <div><dt>插件包</dt><dd>348.9 MB（压缩后 113.6 MB），含工作台与推理引擎</dd></div>
+      <div><dt>插件包</dt><dd>348.9 MB（压缩后 113.6 MB），含工作台、推理引擎与通话功能</dd></div>
       <div><dt>声音模型</dt><dd>约 2.7 GB，首次启动自动下载，之后可离线运行</dd></div>
       <div><dt>系统</dt><dd>Windows x64，Node.js ≥ 22，DSH ≥ 0.2.1-rc.5</dd></div>
       <div><dt>显卡</dt><dd>支持 Vulkan。没有独显也能跑，只是慢一些</dd></div>
