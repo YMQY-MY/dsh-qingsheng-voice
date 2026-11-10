@@ -1,9 +1,7 @@
 // 通话界面：内嵌在声音插件里，复用它的工具栏扩展点与 RPC 通道。
 // 由 lib/client.js 在加载完成后调用 apply 挂上去。
 window.__QingShengCall__ = (function (shared) {
-  const require = shared.require;  const React = require('react');
-  const {createRoot} = require('react-dom/client');
-  const {useState,useEffect,useRef} = React, h = React.createElement;
+  let require, React;   // 由 apply() 在拿到 shared 后才赋值（脚本加载时 shared 还是空的）
   const RATE = 16000;
   const btnStyle = {font:'inherit',fontSize:12,border:'1px solid #83918a66',borderRadius:7,padding:'5px 8px',background:'transparent',color:'inherit',cursor:'pointer',minHeight:32};
 
@@ -273,6 +271,9 @@ window.__QingShengCall__ = (function (shared) {
     return value;
   }
   function apply(ctx, shared){
+    require = shared.require; React = require('react');   // 此刻 shared 才真正可用
+    const {createRoot} = require('react-dom/client');
+    const {useState,useEffect,useRef} = React, h = React.createElement;
     const workspace = ctx.get ? ctx.get('uiWorkspace') : shared.workspace;
     const call=(input,signal)=>preserveChatSelection(workspace,input,async()=>{const r=await shared.rpc('qingsheng/call',input,signal);if(!r.ok)throw Error(r.error?.message||'通话连接失败。');return r.value;});
     const controller={active:false,listeners:new Set(),notify(){for(const listener of this.listeners)listener();}};
@@ -284,5 +285,4 @@ window.__QingShengCall__ = (function (shared) {
     return ()=>{try{root.unmount();}catch{} try{container.remove();}catch{}};
   }
   return {apply};
-  return {apply};
-});
+})({});

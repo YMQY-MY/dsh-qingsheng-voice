@@ -1,6 +1,6 @@
 {
   "name": "dsh-qingsheng-voice",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "清声 · 大肥鱼语音：为 DeepSeek-Harness 提供本地 TTS 朗读、语音输入与音色工作室，自带工作台、推理引擎与通话功能，全部在本机运行",
   "type": "module",
   "main": "./src/index.mjs",
