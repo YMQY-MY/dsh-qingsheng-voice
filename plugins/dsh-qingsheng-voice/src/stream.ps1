@@ -1,7 +1,13 @@
 $ErrorActionPreference = 'Stop'
 [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
-$config = [Console]::In.ReadLine() | ConvertFrom-Json
+# PS 5.1 的 Console.In 按 ANSI 代码页解码，中文路径会变乱码（用户名含中文 = 完全无声）。
+# 必须用 UTF-8 StreamReader 包住标准输入。
+Add-Type -AssemblyName System.Runtime
+$utf8Enc = [System.Text.Encoding]::GetEncoding(65001, [System.Text.EncoderFallback]::ExceptionFallback, [System.Text.DecoderFallback]::ExceptionFallback)
+$stdin = [Console]::OpenStandardInput()
+$utf8In = [System.IO.StreamReader]::new($stdin, $utf8Enc)
+$config = $utf8In.ReadLine() | ConvertFrom-Json
 $source = @'
 using System;
 using System.Collections.Generic;
@@ -54,6 +60,8 @@ Add-Type -Path $assembly
 $player = New-Object QingShengWave ([int]$config.sampleRate)
 [QingShengWave]::StartInput()
 $paused = $false
+$streamId = ""
+$doneSent = $false
 $cursor = 0L
 $last = -1000
 $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -64,15 +72,17 @@ try {
     $line = [QingShengWave]::ReadCommand(10)
     if ($null -ne $line) {
       $command = $line | ConvertFrom-Json
+      if ($null -ne $command.streamId) { $streamId = [string]$command.streamId }
       $action = [string]$command.action
       switch ($action) {
-        'audio' { $player.Add([Convert]::FromBase64String([string]$command.data)) }
+        'begin' { }
+        'audio' { $doneSent = $false; $player.Add([Convert]::FromBase64String([string]$command.data)) }
         'pause' { $player.Pause(); $paused = $true }
         'resume' { $player.Resume(); $paused = $false }
         'cut' { $player.Cut(); $paused = $false }
         'finish' { }
         'stop' { $running = $false }
-        default { throw ('Unknown audio command: ' + $action) }
+        default { }   # ignore unknown commands: never let one kill the player
       }
     }
     $queued = $player.Collect()
@@ -81,11 +91,11 @@ try {
     if ($due -and ($played -ne $cursor)) {
       $last = $clock.ElapsedMilliseconds
       $cursor = $played
-      [Console]::Out.WriteLine((@{type='position';bytes=$played;paused=$paused} | ConvertTo-Json -Compress))
+      [Console]::Out.WriteLine((@{type='position';streamId=$streamId;bytes=$played;paused=$paused} | ConvertTo-Json -Compress))
     }
-    if (($queued -eq 0) -and (-not $paused) -and ($played -gt 0)) {
-      [Console]::Out.WriteLine((@{type='done';bytes=$played} | ConvertTo-Json -Compress))
-      $cursor = 0
+    if (($queued -eq 0) -and (-not $paused) -and ($played -gt 0) -and (-not $doneSent)) {
+      [Console]::Out.WriteLine((@{type='done';streamId=$streamId;bytes=$played} | ConvertTo-Json -Compress))
+      $doneSent = $true
     }
     if ([QingShengWave]::InputClosed) { $running = $false }
   }
