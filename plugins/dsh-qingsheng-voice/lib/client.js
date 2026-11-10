@@ -350,6 +350,7 @@ window.__ModuleLoader__.load({id:'dsh-qingsheng-voice',factory:(require) => {
   }
 
   function apply(ctx) {
+    const rpc=(method,input,signal)=>ctx.connection.rpc.call('/api',method,input,signal);
     const call=async(input,signal)=>{const r=await ctx.connection.rpc.call('/api','qingsheng/control',input,signal);if(!r.ok){const message=r.error?.message||'语音插件连接失败。';throw Error(message.includes('未知语音操作')?'插件界面与后台版本不同，请在 DSH 中重新加载清声插件或重启 DSH。':message);}return r.value;};
     // 扩展点：其它插件（如通话）把按钮挂进这条工具栏，而不是抢占同一个插槽把整组按钮替换掉。
     const extras=[];
@@ -376,6 +377,27 @@ window.__ModuleLoader__.load({id:'dsh-qingsheng-voice',factory:(require) => {
     } catch (e) { ctx.logger?.warn?.('扩展点注册失败：' + e.message); }
     ctx.slots.inject('conversation.input.activity',()=>ctx.slots.register({name:'conversation.input.activity',inject:()=>({call,extra:Array.isArray(extras)?extras.filter(Boolean):[],subscribeExtra:subscribe})},VoiceControls));
     ctx.slots.inject('plugins.bundle.config',()=>ctx.slots.register({name:'plugins.bundle.config',key:'dsh-qingsheng-voice',inject:()=>({call})},VoiceSettings));
+    // 通话界面：内嵌功能，和语音共用这个插件的工具栏与 RPC。
+    // 加载失败只让通话不可用，不能影响朗读。
+    let disposeCall = null;
+    (async () => {
+      try {
+        const url = new URL('./call-studio.js', document.currentScript?.src || location.href).href;
+        await new Promise((resolve, reject) => {
+          if (window.__QingShengCall__) return resolve();
+          const s = document.createElement('script');
+          s.src = url; s.async = true;
+          s.onload = resolve; s.onerror = () => reject(Error('通话界面脚本加载失败。'));
+          document.head.appendChild(s);
+        });
+        const mod = window.__QingShengCall__;
+        if (!mod) throw Error('通话界面未注册。');
+        disposeCall = mod.apply(ctx, { rpc, require, toolbar: extraApi, workspace: (ctx.get ? ctx.get('uiWorkspace') : undefined) });
+      } catch (e) {
+        ctx.logger?.warn?.('通话界面未加载：' + (e?.message || e));
+      }
+    })();
+    try { ctx.effect(() => () => { try { disposeCall?.(); } catch {} }); } catch {}
   }
   return {apply,inject:['connection','slots']};
 }});

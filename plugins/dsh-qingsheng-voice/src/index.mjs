@@ -5,6 +5,7 @@ import { VoiceBridge } from './bridge.mjs';
 import { StudioLauncher } from './launcher.mjs';
 import { Autostart } from './autostart.mjs';
 import {latestReplyText,assistantHistory,historyReply} from './text.mjs';
+import {createCall} from '../call/index.mjs';
 export const name = 'qingsheng-voice';
 export const inject = ['sessions','connection'];
 export async function apply(ctx, options = {}) {
@@ -25,13 +26,32 @@ export async function apply(ctx, options = {}) {
     else ctx.logger?.warn?.('清声工作台未就绪：' + (r.reason === 'not-installed' ? '未找到安装目录' : r.reason || '未知原因'));
   }).catch(() => {});
   const bridge = await new VoiceBridge(config,{readLatest:id=>latestReplyText(ctx.sessions,id),readHistory:id=>assistantHistory(ctx.sessions,id)}).init();
+  // 通话能力内嵌：引擎、模型、播放器全用本插件这一份，不再是另一个插件。
+  // 用户可用 QINGSHENG_CALL=0 关掉。
+  let call = null;
+  if (process.env.QINGSHENG_CALL !== '0') {
+    try {
+      call = createCall(ctx, {
+        logger: ctx.logger,
+        voice: {speak: (text, signal) => bridge.speak(text, signal), interrupt: reason => bridge.interrupt(reason)},
+        studioUrl: config.studioUrl,
+        engineAudioDir: path.join(import.meta.dirname, '..', 'studio', 'engine', 'audio'),
+        modelRoot: path.join(import.meta.dirname, '..', 'studio', 'engine', 'models'),
+      });
+      ctx.connection.fetch.register(call.route);
+      ctx.logger?.info?.('清声 · 通话功能已就绪。');
+    } catch (e) {
+      ctx.logger?.warn?.('通话功能初始化失败：' + e.message);
+      call = null;
+    }
+  }
   const root = ctx.root || ctx;
   const offEvent = root.on('session/event',(session,event) => {
     try { bridge.event(session,event); } catch(e) { bridge.error = e.message; ctx.logger?.warn?.('清声语音事件处理失败：'+e.message); }
   },{global:true});
   const offDisposed = root.on('session/disposed',session => { if(String(session?.id || session?.header?.id) === bridge.focus)bridge.select(''); },{global:true});
   const transcriptions = new Set();
-  ctx.effect(() => async () => { offEvent(); offDisposed(); for(const c of transcriptions)c.abort(); await bridge.dispose(); });
+  ctx.effect(() => async () => { offEvent(); offDisposed(); for(const c of transcriptions)c.abort(); try{call?.dispose();}catch{} await bridge.dispose(); });
   let lastLaunch = 0;
   ctx.connection.fetch.register({
     path:'/api/qingsheng/control',methods:['POST'],requestBody:'buffered',
